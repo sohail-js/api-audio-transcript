@@ -1,3 +1,6 @@
+// Load environment variables from .env file
+import "dotenv/config";
+
 import { serve } from "@hono/node-server";
 import { Hono, Context } from "hono";
 import { TranscriptionService } from "./services/transcription-service.js";
@@ -5,13 +8,20 @@ import { mkdir } from "fs/promises";
 import { join } from "path";
 
 // Initialize service
-const transcriptionService = new TranscriptionService();
+let transcriptionService: TranscriptionService;
 
-// Initialize at startup
-transcriptionService.initialize().catch((error) => {
-  console.error("Failed to initialize Whisper:", error);
+try {
+  transcriptionService = new TranscriptionService();
+  // Initialize at startup
+  transcriptionService.initialize().catch((error) => {
+    console.error("Failed to initialize OpenAI Whisper service:", error);
+    process.exit(1);
+  });
+} catch (error) {
+  console.error("Failed to create TranscriptionService:", error);
+  console.error("Please ensure OPENAI_API_KEY environment variable is set");
   process.exit(1);
-});
+}
 
 const app = new Hono();
 
@@ -30,9 +40,11 @@ app.post("/transcribe", async (c: Context) => {
     // Prepare requests directory
     const projectRoot = process.cwd();
     const requestsBaseDir = join(projectRoot, "requests");
-    const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    const requestId = `req-${Date.now()}-${Math.random()
+      .toString(36)
+      .substring(2, 7)}`;
     requestDir = join(requestsBaseDir, requestId);
-    
+
     await mkdir(requestDir, { recursive: true });
     console.log(`Created request directory: ${requestDir}`);
 
@@ -40,66 +52,68 @@ app.post("/transcribe", async (c: Context) => {
     const { default: Busboy } = await import("busboy");
     const { Readable } = await import("stream");
     const { createWriteStream } = await import("fs");
-    
+
     // Create a promise to handle the file upload
-    const uploadPromise = new Promise<{ filePath: string; filename: string }>((resolve, reject) => {
-      try {
-        const bb = Busboy({ headers: { "content-type": contentType } });
-        let fileFound = false;
+    const uploadPromise = new Promise<{ filePath: string; filename: string }>(
+      (resolve, reject) => {
+        try {
+          const bb = Busboy({ headers: { "content-type": contentType } });
+          let fileFound = false;
 
-        bb.on("file", (name, file, info) => {
-          const { filename } = info;
-          console.log(`Received file field: ${name}, filename: ${filename}`);
-          
-          if (name !== "audio") {
-            console.log(`Skipping field: ${name}`);
-            file.resume(); // Skip non-audio fields
-            return;
-          }
+          bb.on("file", (name, file, info) => {
+            const { filename } = info;
+            console.log(`Received file field: ${name}, filename: ${filename}`);
 
-          fileFound = true;
-          const ext = getFileExtension(filename) || "mp3";
-          const savePath = join(requestDir!, `original.${ext}`);
+            if (name !== "audio") {
+              console.log(`Skipping field: ${name}`);
+              file.resume(); // Skip non-audio fields
+              return;
+            }
 
-          console.log(`Streaming upload to: ${savePath}`);
-          const writeStream = createWriteStream(savePath);
-          
-          file.pipe(writeStream);
+            fileFound = true;
+            const ext = getFileExtension(filename) || "mp3";
+            const savePath = join(requestDir!, `original.${ext}`);
 
-          writeStream.on("finish", () => {
-            console.log("File write completed");
-            resolve({ filePath: savePath, filename });
+            console.log(`Streaming upload to: ${savePath}`);
+            const writeStream = createWriteStream(savePath);
+
+            file.pipe(writeStream);
+
+            writeStream.on("finish", () => {
+              console.log("File write completed");
+              resolve({ filePath: savePath, filename });
+            });
+
+            writeStream.on("error", (err) => {
+              console.error("File write error:", err);
+              reject(err);
+            });
           });
 
-          writeStream.on("error", (err) => {
-            console.error("File write error:", err);
+          bb.on("error", (err) => {
+            console.error("Busboy error:", err);
             reject(err);
           });
-        });
 
-        bb.on("error", (err) => {
-          console.error("Busboy error:", err);
-          reject(err);
-        });
+          bb.on("finish", () => {
+            console.log("Busboy parsing finished");
+            if (!fileFound) {
+              reject(new Error("No audio file found in request"));
+            }
+          });
 
-        bb.on("finish", () => {
-          console.log("Busboy parsing finished");
-          if (!fileFound) {
-            reject(new Error("No audio file found in request"));
+          if (c.req.raw.body) {
+            // @ts-ignore
+            const nodeStream = Readable.fromWeb(c.req.raw.body);
+            nodeStream.pipe(bb);
+          } else {
+            reject(new Error("Request body is empty"));
           }
-        });
-
-        if (c.req.raw.body) {
-          // @ts-ignore
-          const nodeStream = Readable.fromWeb(c.req.raw.body);
-          nodeStream.pipe(bb);
-        } else {
-          reject(new Error("Request body is empty"));
+        } catch (err) {
+          reject(err);
         }
-      } catch (err) {
-        reject(err);
       }
-    });
+    );
 
     // Wait for upload to complete
     const { filePath } = await uploadPromise;
@@ -117,7 +131,7 @@ app.post("/transcribe", async (c: Context) => {
       processingTimeSeconds: parseFloat(processingTimeSeconds),
       processingTimeMs,
       requestId,
-      debugPath: requestDir
+      debugPath: requestDir,
     });
   } catch (error) {
     console.error("Transcription error:", error);
@@ -128,17 +142,18 @@ app.post("/transcribe", async (c: Context) => {
       },
       500
     );
-  } 
+  }
   // NOTE: Cleanup removed for debugging purposes as requested
 });
 
 // Health check endpoint
 app.get("/", (c: Context) => {
-  return c.json({ 
-    message: "Whisper Transcription API", 
+  return c.json({
+    message: "OpenAI Whisper Transcription API",
     status: "ok",
-    model: "tiny",
-    languages: "Auto-detect (Hindi, Urdu, English, 99+ more)"
+    model: "whisper-1",
+    provider: "OpenAI",
+    languages: "Auto-detect (Hindi, Urdu, English, 99+ more)",
   });
 });
 
@@ -152,7 +167,8 @@ function getFileExtension(filename: string): string | null {
 
 const port = 3001;
 console.log(`Server is running on port ${port}`);
-console.log(`Whisper model: base (multilingual, auto-detect)`);
+console.log(`Using OpenAI Whisper API (whisper-1 model)`);
+console.log(`Make sure OPENAI_API_KEY environment variable is set`);
 
 serve({
   fetch: app.fetch,

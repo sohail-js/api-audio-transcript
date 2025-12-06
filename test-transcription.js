@@ -1,5 +1,8 @@
 #!/usr/bin/env node
 
+// Load environment variables from .env file
+import "dotenv/config";
+
 /**
  * Test script to diagnose transcription issues
  * This script will test the transcription service directly
@@ -32,9 +35,9 @@ async function testTranscription() {
     console.log(`Testing file: ${testAudioPath}\n`);
 
     // Initialize the transcription service
-    console.log("1. Initializing Whisper model...");
+    console.log("1. Initializing OpenAI Whisper API service...");
     await transcriptionService.initialize();
-    console.log("✓ Model initialized successfully\n");
+    console.log("✓ Service initialized successfully\n");
 
     // Transcribe
     console.log("2. Transcribing audio...");
@@ -56,6 +59,8 @@ async function testTranscription() {
       console.log("  2. Audio quality is too poor");
       console.log("  3. Audio format not supported");
       console.log("  4. File is corrupted");
+      console.log("  5. OpenAI API key is invalid or missing");
+      console.log("  6. Network/API connection issues");
     } else {
       console.log("✓ Transcription successful!");
     }

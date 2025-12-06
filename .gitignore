@@ -30,3 +30,4 @@ Thumbs.db
 # Transformers.js cache
 .cache/
 
+requests/
