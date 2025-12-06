@@ -137,7 +137,7 @@ app.get("/", (c: Context) => {
   return c.json({ 
     message: "Whisper Transcription API", 
     status: "ok",
-    model: "base",
+    model: "tiny",
     languages: "Auto-detect (Hindi, Urdu, English, 99+ more)"
   });
 });

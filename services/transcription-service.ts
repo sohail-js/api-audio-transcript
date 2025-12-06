@@ -9,7 +9,7 @@ import { unlink } from "fs/promises";
  * This uses the official OpenAI Whisper C++ implementation
  */
 export class TranscriptionService {
-  private modelName: string = "base"; // base model for good speed/accuracy balance
+  private modelName: string = "tiny"; // Use 'tiny' model for faster processing (was 'base')
   private isInitialized: boolean = false;
 
   /**
@@ -41,12 +41,17 @@ export class TranscriptionService {
       
       // Check audio duration first
       const duration = await this.getAudioDuration(filePath);
-      console.log(`Audio duration: ${duration} seconds`);
+      console.log(`Audio duration detected: ${duration} seconds`);
       
-      // If audio is longer than 10 minutes, split into chunks and process in parallel
-      if (duration > 600) {
-        console.log("Large file detected, processing in parallel chunks...");
+      // If audio is longer than 60 seconds (lowered for testing), split into chunks
+      // Original was 600 (10 minutes)
+      const PARALLEL_THRESHOLD = 60; 
+      
+      if (duration > PARALLEL_THRESHOLD) {
+        console.log(`Large file detected (> ${PARALLEL_THRESHOLD}s), processing in parallel chunks...`);
         return await this.transcribeInChunks(filePath, duration);
+      } else {
+        console.log(`Short file detected (<= ${PARALLEL_THRESHOLD}s), processing normally...`);
       }
       
       // For smaller files, process normally
@@ -66,12 +71,19 @@ export class TranscriptionService {
     const execAsync = promisify(exec);
     
     try {
-      const { stdout } = await execAsync(
+      console.log(`Getting duration for: ${filePath}`);
+      const { stdout, stderr } = await execAsync(
         `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
       );
-      return parseFloat(stdout.trim());
+      console.log(`ffprobe output: "${stdout.trim()}"`);
+      const duration = parseFloat(stdout.trim());
+      if (isNaN(duration)) {
+        console.warn("Parsed duration is NaN");
+        return 0;
+      }
+      return duration;
     } catch (error) {
-      console.warn("Could not determine audio duration, assuming short file");
+      console.warn("Could not determine audio duration:", error);
       return 0;
     }
   }
@@ -103,18 +115,19 @@ export class TranscriptionService {
     
     console.log(`Created ${chunkFiles.length} chunk files, processing in parallel...`);
     
-    // Process chunks in parallel (max 4 at a time to avoid overwhelming the system)
-    const maxConcurrent = 4;
+    // Process chunks in parallel (max 2 at a time to avoid overwhelming the CPU)
+    // 4 instances * 4 threads = 16 threads > 12 available threads -> Slowness
+    const maxConcurrent = 2;
     const results: string[] = [];
     
     for (let i = 0; i < chunkFiles.length; i += maxConcurrent) {
       const batch = chunkFiles.slice(i, i + maxConcurrent);
+      console.log(`Processing batch ${Math.ceil((i + 1) / maxConcurrent)}/${Math.ceil(chunkFiles.length / maxConcurrent)} (Chunks ${i}-${i + batch.length - 1})`);
+      
       const batchResults = await Promise.all(
         batch.map(chunkFile => this.transcribeSingle(chunkFile))
       );
       results.push(...batchResults);
-      
-      console.log(`Processed chunks ${i + 1}-${Math.min(i + maxConcurrent, chunkFiles.length)} of ${chunkFiles.length}`);
     }
     
     // Clean up chunk files - DISABLED for debugging
@@ -131,39 +144,97 @@ export class TranscriptionService {
    * Transcribe a single file (or chunk)
    */
   private async transcribeSingle(filePath: string): Promise<string> {
-    // Configure transcription options
-    const options: any = {
-      modelName: this.modelName,
-      autoDownloadModelName: this.modelName,
-      whisperOptions: {
-        language: "hi",  // Force Hindi - prevents auto-translation to English
-        translateToEnglish: false,  // Double insurance
-      },
-    };
+    // await this.initialize(); // Already called in transcribe()
 
-    console.log("Whisper options:", JSON.stringify(options, null, 2));
+    try {
+      console.log(`Transcribing file: ${filePath}`);
+      
+      // Convert to WAV if needed (whisper-cli requires WAV)
+      const { exec } = await import("child_process");
+      const { promisify } = await import("util");
+      const execAsync = promisify(exec);
+      
+      let wavFile = filePath;
+      if (!filePath.endsWith('.wav')) {
+        wavFile = filePath.replace(/\.[^.]+$/, '.wav');
+        console.log(`Converting to WAV: ${wavFile}`);
+        await execAsync(`ffmpeg -i "${filePath}" -ar 16000 -ac 1 -c:a pcm_s16le "${wavFile}"`);
+      }
+      
+      const whisperPath = "node_modules/nodejs-whisper/cpp/whisper.cpp/build/bin/whisper-cli";
+      const modelPath = `node_modules/nodejs-whisper/cpp/whisper.cpp/models/ggml-${this.modelName}.bin`;
+      
+      // CRITICAL: Use -l hi (not auto) and do NOT use -tr flag
+      // This forces transcription in Hindi, not translation to English
+      const command = `"${whisperPath}" -l hi -m "${modelPath}" -f "${wavFile}" --no-timestamps -otxt`;
+      
+      console.log(`Executing: ${command}`);
+      
+      try {
+        const { stdout, stderr } = await execAsync(command, {
+          cwd: process.cwd(),
+          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
+        });
+        
+        if (stderr) {
+            // whisper-cli writes progress to stderr, which is normal
+            // But we should check if it contains errors
+            // console.log(`Whisper stderr: ${stderr.substring(0, 200)}...`);
+        }
+      } catch (execError: any) {
+        console.error(`Whisper execution failed for ${wavFile}`);
+        console.error(`Command: ${command}`);
+        console.error(`Error: ${execError.message}`);
+        if (execError.stderr) console.error(`Stderr: ${execError.stderr}`);
+        throw execError;
+      }
+      
+      // Read the generated .txt file (whisper-cli creates filename.wav.txt)
+      const { readFile } = await import("fs/promises");
+      const txtFile = `${wavFile}.txt`;
+      
+      let text = "";
+      try {
+        console.log(`Reading output file: ${txtFile}`);
+        text = await readFile(txtFile, "utf-8");
+        text = text.trim();
+        console.log(`Read ${text.length} chars from ${txtFile}`);
+        
+        // Clean up the txt file - DISABLED for debugging
+        // await unlink(txtFile).catch(() => {});
+        
+        // Clean up WAV file if we created it - DISABLED for debugging
+        // if (wavFile !== filePath) {
+        //   await unlink(wavFile).catch(() => {});
+        // }
+      } catch (error) {
+        console.error(`Error reading transcription file ${txtFile}:`, error);
+        // Fallback to stdout if file reading fails, though whisper-cli usually writes to file with -otxt
+        // text = stdout.trim(); 
+        return "";
+      }
+      
+      // Remove any timestamps that might still appear (though --no-timestamps should prevent this)
+      text = this.removeTimestamps(text);
+      
+      // Basic validation
+      if (!text || text.length === 0) {
+        return "";
+      }
 
-    // Transcribe the audio file
-    const output = await nodewhisper(filePath, options);
-    
-    // nodejs-whisper returns the text directly
-    let text = typeof output === "string" ? output.trim() : "";
-    
-    // Remove any timestamps that might still appear
-    text = this.removeTimestamps(text);
-    
-    // Basic validation
-    if (!text || text.length === 0) {
-      return "";
+      // Check for obvious hallucinations
+      if (this.isLikelyHallucination(text)) {
+        console.warn("Detected likely hallucination in chunk, skipping");
+        return "";
+      }
+
+      return text;
+    } catch (error) {
+      console.error("Transcription error in transcribeSingle:", error);
+      throw new Error(
+        `Failed to transcribe single file: ${error instanceof Error ? error.message : "Unknown error"}`
+      );
     }
-
-    // Check for obvious hallucinations
-    if (this.isLikelyHallucination(text)) {
-      console.warn("Detected likely hallucination in chunk, skipping");
-      return "";
-    }
-
-    return text;
   }
 
   /**
