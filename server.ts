@@ -1,9 +1,8 @@
 import { serve } from "@hono/node-server";
 import { Hono, Context } from "hono";
 import { TranscriptionService } from "./services/transcription-service.js";
-import { writeFile, unlink } from "fs/promises";
+import { mkdir } from "fs/promises";
 import { join } from "path";
-import { tmpdir } from "os";
 
 // Initialize service
 const transcriptionService = new TranscriptionService();
@@ -17,9 +16,8 @@ transcriptionService.initialize().catch((error) => {
 const app = new Hono();
 
 // POST /transcribe endpoint
-// POST /transcribe endpoint
 app.post("/transcribe", async (c: Context) => {
-  let tempFilePath: string | null = null;
+  let requestDir: string | null = null;
   const startTime = Date.now();
 
   try {
@@ -29,7 +27,16 @@ app.post("/transcribe", async (c: Context) => {
       return c.json({ error: "Content-Type must be multipart/form-data" }, 400);
     }
 
-    // Use Busboy for streaming file upload (handles large files better than formData())
+    // Prepare requests directory
+    const projectRoot = process.cwd();
+    const requestsBaseDir = join(projectRoot, "requests");
+    const requestId = `req-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`;
+    requestDir = join(requestsBaseDir, requestId);
+    
+    await mkdir(requestDir, { recursive: true });
+    console.log(`Created request directory: ${requestDir}`);
+
+    // Use Busboy for streaming file upload
     const { default: Busboy } = await import("busboy");
     const { Readable } = await import("stream");
     const { createWriteStream } = await import("fs");
@@ -52,9 +59,7 @@ app.post("/transcribe", async (c: Context) => {
 
           fileFound = true;
           const ext = getFileExtension(filename) || "mp3";
-          const tempName = `whisper-${Date.now()}.${ext}`;
-          const savePath = join(tmpdir(), tempName);
-          tempFilePath = savePath; // Save ref for cleanup
+          const savePath = join(requestDir!, `original.${ext}`);
 
           console.log(`Streaming upload to: ${savePath}`);
           const writeStream = createWriteStream(savePath);
@@ -82,12 +87,10 @@ app.post("/transcribe", async (c: Context) => {
           if (!fileFound) {
             reject(new Error("No audio file found in request"));
           }
-          // If fileFound is true, we wait for writeStream.on("finish") to resolve
         });
 
-        // Convert Web Stream to Node Stream and pipe to Busboy
         if (c.req.raw.body) {
-          // @ts-ignore - Readable.fromWeb is available in Node 18+
+          // @ts-ignore
           const nodeStream = Readable.fromWeb(c.req.raw.body);
           nodeStream.pipe(bb);
         } else {
@@ -113,6 +116,8 @@ app.post("/transcribe", async (c: Context) => {
       text,
       processingTimeSeconds: parseFloat(processingTimeSeconds),
       processingTimeMs,
+      requestId,
+      debugPath: requestDir
     });
   } catch (error) {
     console.error("Transcription error:", error);
@@ -123,17 +128,8 @@ app.post("/transcribe", async (c: Context) => {
       },
       500
     );
-  } finally {
-    // Clean up temporary file
-    if (tempFilePath) {
-      try {
-        await unlink(tempFilePath);
-        console.log(`Cleaned up temp file: ${tempFilePath}`);
-      } catch (err) {
-        console.warn(`Failed to delete temp file: ${tempFilePath}`);
-      }
-    }
-  }
+  } 
+  // NOTE: Cleanup removed for debugging purposes as requested
 });
 
 // Health check endpoint

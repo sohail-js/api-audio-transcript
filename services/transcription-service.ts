@@ -117,8 +117,8 @@ export class TranscriptionService {
       console.log(`Processed chunks ${i + 1}-${Math.min(i + maxConcurrent, chunkFiles.length)} of ${chunkFiles.length}`);
     }
     
-    // Clean up chunk files
-    await Promise.all(chunkFiles.map(file => unlink(file).catch(() => {})));
+    // Clean up chunk files - DISABLED for debugging
+    // await Promise.all(chunkFiles.map(file => unlink(file).catch(() => {})));
     
     // Combine results
     const combinedText = results.filter(r => r.length > 0).join(" ");
