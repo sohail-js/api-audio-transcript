@@ -1,16 +1,16 @@
 import { serve } from "@hono/node-server";
 import { Hono, Context } from "hono";
-import { AudioService } from "./services/audio-service";
-import { TranscriptionService } from "./services/transcription-service";
-import { createTempFile, safeDeleteFile } from "./utils/file-utils";
+import { TranscriptionService } from "./services/transcription-service.js";
+import { writeFile, unlink } from "fs/promises";
+import { join } from "path";
+import { tmpdir } from "os";
 
-// Initialize services
-const audioService = new AudioService();
+// Initialize service
 const transcriptionService = new TranscriptionService();
 
-// Initialize transcriber at startup
+// Initialize at startup
 transcriptionService.initialize().catch((error) => {
-  console.error("Failed to initialize Whisper model:", error);
+  console.error("Failed to initialize Whisper:", error);
   process.exit(1);
 });
 
@@ -35,28 +35,15 @@ app.post("/transcribe", async (c: Context) => {
     }
 
     // Save uploaded file to temporary location
-    tempFilePath = await createTempFile(audioFile);
-
-    // Process audio file (decode/convert to Float32Array)
-    const audioData = await audioService.processAudioFile(tempFilePath);
-    console.log(`Audio data length: ${audioData.length} samples`);
-
-    // Validate audio data
-    if (!audioData || audioData.length === 0) {
-      return c.json(
-        {
-          error:
-            "Invalid audio data: audio file appears to be empty or corrupted",
-        },
-        400
-      );
-    }
+    const buffer = await audioFile.arrayBuffer();
+    const fileName = `whisper-${Date.now()}.${getFileExtension(audioFile.name) || "mp3"}`;
+    tempFilePath = join(tmpdir(), fileName);
+    
+    await writeFile(tempFilePath, Buffer.from(buffer));
+    console.log(`Saved temp file: ${tempFilePath}`);
 
     // Transcribe audio
-    const text = await transcriptionService.transcribe(audioData);
-    console.log(
-      `Transcription result: "${text}" (length: ${text.length} characters)`
-    );
+    const text = await transcriptionService.transcribe(tempFilePath);
 
     // Calculate processing time
     const processingTimeMs = Date.now() - startTime;
@@ -79,18 +66,37 @@ app.post("/transcribe", async (c: Context) => {
   } finally {
     // Clean up temporary file
     if (tempFilePath) {
-      await safeDeleteFile(tempFilePath);
+      try {
+        await unlink(tempFilePath);
+        console.log(`Cleaned up temp file: ${tempFilePath}`);
+      } catch (err) {
+        console.warn(`Failed to delete temp file: ${tempFilePath}`);
+      }
     }
   }
 });
 
 // Health check endpoint
 app.get("/", (c: Context) => {
-  return c.json({ message: "Whisper Transcription API", status: "ok" });
+  return c.json({ 
+    message: "Whisper Transcription API", 
+    status: "ok",
+    model: "base",
+    languages: "Auto-detect (Hindi, Urdu, English, 99+ more)"
+  });
 });
+
+/**
+ * Extract file extension from filename
+ */
+function getFileExtension(filename: string): string | null {
+  const parts = filename.split(".");
+  return parts.length > 1 ? parts[parts.length - 1] : null;
+}
 
 const port = 3001;
 console.log(`Server is running on port ${port}`);
+console.log(`Whisper model: base (multilingual, auto-detect)`);
 
 serve({
   fetch: app.fetch,
