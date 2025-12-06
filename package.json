@@ -20,10 +20,12 @@
   "dependencies": {
     "@hono/node-server": "^1.12.0",
     "@indic-transliteration/sanscript": "^1.3.3",
+    "busboy": "^1.6.0",
     "hono": "^4.5.0",
     "nodejs-whisper": "latest"
   },
   "devDependencies": {
+    "@types/busboy": "^1.5.4",
     "@types/node": "^20.11.0",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3"

@@ -17,33 +17,93 @@ transcriptionService.initialize().catch((error) => {
 const app = new Hono();
 
 // POST /transcribe endpoint
+// POST /transcribe endpoint
 app.post("/transcribe", async (c: Context) => {
   let tempFilePath: string | null = null;
   const startTime = Date.now();
 
   try {
-    // Parse and validate request
-    const formData = await c.req.formData();
-    const audioFile = formData.get("audio");
-
-    if (!audioFile) {
-      return c.json({ error: "No audio file provided" }, 400);
+    // Check Content-Type
+    const contentType = c.req.header("content-type");
+    if (!contentType || !contentType.includes("multipart/form-data")) {
+      return c.json({ error: "Content-Type must be multipart/form-data" }, 400);
     }
 
-    if (typeof audioFile === "string") {
-      return c.json({ error: "Invalid audio file format" }, 400);
-    }
-
-    // Save uploaded file to temporary location
-    const buffer = await audioFile.arrayBuffer();
-    const fileName = `whisper-${Date.now()}.${getFileExtension(audioFile.name) || "mp3"}`;
-    tempFilePath = join(tmpdir(), fileName);
+    // Use Busboy for streaming file upload (handles large files better than formData())
+    const { default: Busboy } = await import("busboy");
+    const { Readable } = await import("stream");
+    const { createWriteStream } = await import("fs");
     
-    await writeFile(tempFilePath, Buffer.from(buffer));
-    console.log(`Saved temp file: ${tempFilePath}`);
+    // Create a promise to handle the file upload
+    const uploadPromise = new Promise<{ filePath: string; filename: string }>((resolve, reject) => {
+      try {
+        const bb = Busboy({ headers: { "content-type": contentType } });
+        let fileFound = false;
+
+        bb.on("file", (name, file, info) => {
+          const { filename } = info;
+          console.log(`Received file field: ${name}, filename: ${filename}`);
+          
+          if (name !== "audio") {
+            console.log(`Skipping field: ${name}`);
+            file.resume(); // Skip non-audio fields
+            return;
+          }
+
+          fileFound = true;
+          const ext = getFileExtension(filename) || "mp3";
+          const tempName = `whisper-${Date.now()}.${ext}`;
+          const savePath = join(tmpdir(), tempName);
+          tempFilePath = savePath; // Save ref for cleanup
+
+          console.log(`Streaming upload to: ${savePath}`);
+          const writeStream = createWriteStream(savePath);
+          
+          file.pipe(writeStream);
+
+          writeStream.on("finish", () => {
+            console.log("File write completed");
+            resolve({ filePath: savePath, filename });
+          });
+
+          writeStream.on("error", (err) => {
+            console.error("File write error:", err);
+            reject(err);
+          });
+        });
+
+        bb.on("error", (err) => {
+          console.error("Busboy error:", err);
+          reject(err);
+        });
+
+        bb.on("finish", () => {
+          console.log("Busboy parsing finished");
+          if (!fileFound) {
+            reject(new Error("No audio file found in request"));
+          }
+          // If fileFound is true, we wait for writeStream.on("finish") to resolve
+        });
+
+        // Convert Web Stream to Node Stream and pipe to Busboy
+        if (c.req.raw.body) {
+          // @ts-ignore - Readable.fromWeb is available in Node 18+
+          const nodeStream = Readable.fromWeb(c.req.raw.body);
+          nodeStream.pipe(bb);
+        } else {
+          reject(new Error("Request body is empty"));
+        }
+      } catch (err) {
+        reject(err);
+      }
+    });
+
+    // Wait for upload to complete
+    const { filePath } = await uploadPromise;
+    console.log(`Upload complete: ${filePath}`);
 
     // Transcribe audio
-    const text = await transcriptionService.transcribe(tempFilePath);
+    const text = await transcriptionService.transcribe(filePath);
 
     // Calculate processing time
     const processingTimeMs = Date.now() - startTime;
