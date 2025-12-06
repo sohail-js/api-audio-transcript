@@ -37,26 +37,30 @@ export class TranscriptionService {
       console.log(`Transcribing file: ${filePath}`);
       
       // Configure transcription options
-      const options = {
-        modelName: this.modelName,           // Model to use (tiny, base, small, medium, large)
-        autoDownloadModelName: this.modelName, // Auto-download if not present
+      // CRITICAL: Set language explicitly to 'hi' to prevent translation
+      // With auto-detect, whisper.cpp translates mixed content to English
+      const options: any = {
+        modelName: this.modelName,
+        autoDownloadModelName: this.modelName,
         whisperOptions: {
-          language: "auto",                  // Auto-detect language
-          gen_file_txt: false,               // Don't generate txt file
-          gen_file_subtitle: false,          // Don't generate subtitle files
-          gen_file_vtt: false,
-          word_timestamps: false,            // Don't need word-level timestamps
-          timestamp_size: 0,
+          language: "hi",  // Force Hindi - prevents auto-translation to English
+          translateToEnglish: false,  // Double insurance
         },
       };
+
+      console.log("Whisper options:", JSON.stringify(options, null, 2));
 
       // Transcribe the audio file
       const output = await nodewhisper(filePath, options);
       
       // nodejs-whisper returns the text directly
-      const text = typeof output === "string" ? output.trim() : "";
+      let text = typeof output === "string" ? output.trim() : "";
+      
+      // Remove any timestamps that might still appear (format: [00:00.000 --> 00:05.000])
+      text = this.removeTimestamps(text);
       
       console.log(`Transcription completed: ${text.length} characters`);
+      console.log(`Preview: ${text.substring(0, 100)}...`);
       
       // Basic validation
       if (!text || text.length === 0) {
@@ -77,6 +81,25 @@ export class TranscriptionService {
         `Failed to transcribe: ${error instanceof Error ? error.message : "Unknown error"}`
       );
     }
+  }
+
+  /**
+   * Remove timestamp patterns from text
+   */
+  private removeTimestamps(text: string): string {
+    // Remove patterns like: [00:00.000 --> 00:05.000]
+    let cleaned = text.replace(/\[\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}\.\d{3}\]/g, "");
+    
+    // Remove patterns like: [00:00:00.000 --> 00:00:05.000]
+    cleaned = cleaned.replace(/\[\d{2}:\d{2}:\d{2}\.\d{3}\s*-->\s*\d{2}:\d{2}:\d{2}\.\d{3}\]/g, "");
+    
+    // Remove standalone timestamps like: [00:00.000]
+    cleaned = cleaned.replace(/\[\d{2}:\d{2}\.\d{3}\]/g, "");
+    
+    // Remove leading/trailing whitespace and multiple spaces
+    cleaned = cleaned.replace(/\s+/g, " ").trim();
+    
+    return cleaned;
   }
 
   /**
