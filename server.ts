@@ -119,8 +119,21 @@ app.post("/transcribe", async (c: Context) => {
     const { filePath } = await uploadPromise;
     console.log(`Upload complete: ${filePath}`);
 
+    // Check for diarize query parameter
+    const diarizeParam = c.req.query("diarize");
+    const useDiarize =
+      diarizeParam === "true" || diarizeParam === "1" || diarizeParam === "yes";
+
+    if (useDiarize) {
+      console.log("Speaker diarization enabled via query parameter");
+    }
+
     // Transcribe audio
-    const text = await transcriptionService.transcribe(filePath);
+    const text = await transcriptionService.transcribe(
+      filePath,
+      undefined,
+      useDiarize
+    );
 
     // Calculate processing time
     const processingTimeMs = Date.now() - startTime;
@@ -132,6 +145,10 @@ app.post("/transcribe", async (c: Context) => {
       processingTimeMs,
       requestId,
       debugPath: requestDir,
+      model: useDiarize
+        ? "gpt-4o-transcribe-diarize"
+        : "gpt-4o-mini-transcribe",
+      diarize: useDiarize,
     });
   } catch (error) {
     console.error("Transcription error:", error);
@@ -151,7 +168,7 @@ app.get("/", (c: Context) => {
   return c.json({
     message: "OpenAI Whisper Transcription API",
     status: "ok",
-    model: "whisper-1",
+    model: "gpt-4o-mini-transcribe",
     provider: "OpenAI",
     languages: "Auto-detect (Hindi, Urdu, English, 99+ more)",
   });
@@ -167,7 +184,7 @@ function getFileExtension(filename: string): string | null {
 
 const port = 3001;
 console.log(`Server is running on port ${port}`);
-console.log(`Using OpenAI Whisper API (whisper-1 model)`);
+console.log(`Using OpenAI Whisper API (gpt-4o-mini-transcribe model)`);
 console.log(`Make sure OPENAI_API_KEY environment variable is set`);
 
 serve({
