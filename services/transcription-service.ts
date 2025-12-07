@@ -435,6 +435,18 @@ export class TranscriptionService {
     try {
       // Get audio duration to calculate chunk size
       const duration = await this.getAudioDuration(filePath);
+
+      // Validate duration - must be positive to calculate chunk sizes
+      if (!duration || duration <= 0 || !isFinite(duration)) {
+        log.error(
+          { duration, filePath },
+          "Invalid or zero audio duration, cannot process in chunks"
+        );
+        throw new Error(
+          "Cannot determine audio duration. The file may be corrupted or in an unsupported format."
+        );
+      }
+
       const fileStats = await stat(filePath);
       const fileSizeBytes = fileStats.size;
       const durationMinutes = (duration / 60).toFixed(2);
@@ -517,7 +529,7 @@ export class TranscriptionService {
 
         const batchResults = await Promise.all(
           batch.map((chunkFile) =>
-            this.transcribeSingle(chunkFile, language, useDiarize)
+            this.transcribeSingle(chunkFile, language, useDiarize, requestId)
           )
         );
         results.push(...batchResults);
@@ -559,11 +571,21 @@ export class TranscriptionService {
   private async transcribeSingle(
     filePath: string,
     language?: string,
-    useDiarize?: boolean
+    useDiarize?: boolean,
+    requestId?: string
   ): Promise<string> {
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
       : "gpt-4o-mini-transcribe";
+
+    // Create logger with context
+    const logContext: Record<string, any> = {
+      filePath,
+      model,
+      operation: "transcribeSingle",
+    };
+    if (requestId) logContext.requestId = requestId;
+    const log = createChildLogger(logContext);
 
     let convertedFilePath: string | null = null;
     let finalFilePath = filePath;
@@ -572,7 +594,7 @@ export class TranscriptionService {
       // Convert to optimized WAV if needed (smaller file size)
       const fileExt = filePath.split(".").pop()?.toLowerCase();
       if (fileExt !== "wav") {
-        convertedFilePath = await this.convertToWav(filePath, true); // optimized
+        convertedFilePath = await this.convertToWav(filePath, true, log); // optimized
         finalFilePath = convertedFilePath;
       }
 
@@ -608,6 +630,11 @@ export class TranscriptionService {
           ? transcription
           : (transcription as any).text || "";
 
+      log.debug(
+        { textLength: text.length },
+        "Transcription completed for chunk"
+      );
+
       // Clean up converted file
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch(() => {});
@@ -619,6 +646,13 @@ export class TranscriptionService {
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch(() => {});
       }
+      log.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        "Error transcribing chunk"
+      );
       throw error;
     }
   }
