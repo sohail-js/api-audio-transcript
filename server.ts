@@ -186,8 +186,21 @@ app.post("/transcribe", async (c: Context) => {
     const useDiarize =
       diarizeParam === "true" || diarizeParam === "1" || diarizeParam === "yes";
 
+    // Check for high accuracy query parameter (uses gpt-4o-transcribe)
+    const accurateParam = c.req.query("accurate");
+    const useHighAccuracy =
+      accurateParam === "true" ||
+      accurateParam === "1" ||
+      accurateParam === "yes";
+
     if (useDiarize) {
       requestLogger.info("Speaker diarization enabled via query parameter");
+    }
+
+    if (useHighAccuracy) {
+      requestLogger.info(
+        "High accuracy model (gpt-4o-transcribe) enabled via query parameter"
+      );
     }
 
     // Transcribe audio (pass requestId for logging context)
@@ -195,7 +208,8 @@ app.post("/transcribe", async (c: Context) => {
       filePath,
       undefined,
       useDiarize,
-      requestId
+      requestId,
+      useHighAccuracy
     );
 
     // Get text generation model from environment or use default
@@ -236,14 +250,22 @@ app.post("/transcribe", async (c: Context) => {
     const processingTimeMs = Date.now() - startTime;
     const processingTimeSeconds = (processingTimeMs / 1000).toFixed(2);
 
+    // Determine model name for logging and response
+    let modelName: string;
+    if (useDiarize) {
+      modelName = "gpt-4o-transcribe-diarize";
+    } else if (useHighAccuracy) {
+      modelName = "gpt-4o-transcribe";
+    } else {
+      modelName = "gpt-4o-mini-transcribe";
+    }
+
     requestLogger.info(
       {
         processingTimeMs,
         processingTimeSeconds: parseFloat(processingTimeSeconds),
         textLength: text.length,
-        model: useDiarize
-          ? "gpt-4o-transcribe-diarize"
-          : "gpt-4o-mini-transcribe",
+        model: modelName,
         hasGeneratedText: !!generatedText,
       },
       "Transcription completed successfully"
@@ -274,10 +296,9 @@ app.post("/transcribe", async (c: Context) => {
       processingTimeSeconds: parseFloat(processingTimeSeconds),
       processingTimeMs,
       requestId,
-      model: useDiarize
-        ? "gpt-4o-transcribe-diarize"
-        : "gpt-4o-mini-transcribe",
+      model: modelName,
       diarize: useDiarize,
+      accurate: useHighAccuracy,
     };
 
     // Add generated text and model info if prompt was provided

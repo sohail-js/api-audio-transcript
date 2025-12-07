@@ -67,6 +67,7 @@ Transcribes an audio file to text using OpenAI's Whisper API.
 - Body: Form data with `audio` field containing the audio file
 - Query Parameters:
   - `diarize` (optional): Set to `true`, `1`, or `yes` to enable speaker diarization for multi-speaker audio (meetings, interviews, etc.)
+  - `accurate` (optional): Set to `true`, `1`, or `yes` to use `gpt-4o-transcribe` model for higher accuracy (better for background noise, complex dialogues, etc.)
 
 **Example using curl (standard transcription):**
 
@@ -80,6 +81,13 @@ curl -X POST http://localhost:3001/transcribe \
 ```bash
 curl -X POST "http://localhost:3001/transcribe?diarize=true" \
   -F "audio=@path/to/your/meeting.mp3"
+```
+
+**Example using curl (with high accuracy model for noisy audio):**
+
+```bash
+curl -X POST "http://localhost:3001/transcribe?accurate=true" \
+  -F "audio=@path/to/your/noisy-audio.mp3"
 ```
 
 **Response:**
@@ -96,7 +104,9 @@ curl -X POST "http://localhost:3001/transcribe?diarize=true" \
 }
 ```
 
-**Note:** When `diarize=true` is used, the model will be `gpt-4o-transcribe-diarize` which identifies and labels different speakers in the transcription. This is ideal for meetings, interviews, or any audio with multiple speakers.
+**Note:** 
+- When `diarize=true` is used, the model will be `gpt-4o-transcribe-diarize` which identifies and labels different speakers in the transcription. This is ideal for meetings, interviews, or any audio with multiple speakers.
+- When `accurate=true` is used, the model will be `gpt-4o-transcribe` which provides higher accuracy, especially useful for audio with background noise or complex dialogues.
 
 ### GET /
 
@@ -116,7 +126,7 @@ Health check endpoint.
 
 ## Model Information
 
-This API supports two OpenAI transcription models:
+This API supports three OpenAI transcription models:
 
 ### Default: gpt-4o-mini-transcribe
 
@@ -126,6 +136,15 @@ This API supports two OpenAI transcription models:
 - **Fast processing** - typically 2-5 seconds for 30-second audio
 - **Cost-effective** - optimized for general transcription needs
 - **No local setup** - runs entirely via API, no model downloads needed
+- **Use when:** General transcription needs, real-time applications, cost-sensitive use cases
+
+### Optional: gpt-4o-transcribe (High Accuracy)
+
+- **Higher accuracy** - improved Word Error Rate (WER) over mini model
+- **Better in challenging conditions** - handles background noise and complex dialogues better
+- **Professional quality** - ideal for professional transcription services, legal documentation, medical records
+- **Use when:** Audio has background noise, complex dialogues, or when accuracy is critical
+- **Enable with:** Add `?accurate=true` query parameter to your request
 
 ### Optional: gpt-4o-transcribe-diarize
 
@@ -134,6 +153,8 @@ This API supports two OpenAI transcription models:
 - **Same language support** - supports 99+ languages with speaker identification
 - **Use when:** Your audio has multiple people talking (meetings, interviews, etc.)
 - **Enable with:** Add `?diarize=true` query parameter to your request
+
+**Note:** If both `diarize=true` and `accurate=true` are specified, `diarize` takes priority and `gpt-4o-transcribe-diarize` will be used.
 
 ## Supported Languages
 

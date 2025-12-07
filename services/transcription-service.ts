@@ -53,19 +53,24 @@ export class TranscriptionService {
    * @param language - Optional language code (e.g., 'hi', 'en', 'ur'). If not provided, auto-detects.
    * @param useDiarize - If true, uses gpt-4o-transcribe-diarize model for speaker diarization
    * @param requestId - Optional request ID for logging context
+   * @param useHighAccuracy - If true, uses gpt-4o-transcribe model for higher accuracy (better for background noise, complex dialogues)
    * @returns Transcribed text
    */
   async transcribe(
     filePath: string,
     language?: string,
     useDiarize?: boolean,
-    requestId?: string
+    requestId?: string,
+    useHighAccuracy?: boolean
   ): Promise<string> {
     await this.initialize();
 
     // Determine model outside try block so it's accessible in catch
+    // Priority: diarize > high accuracy > default mini
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
+      : useHighAccuracy
+      ? "gpt-4o-transcribe"
       : "gpt-4o-mini-transcribe";
 
     // Create logger with context
@@ -105,7 +110,8 @@ export class TranscriptionService {
           filePath,
           language,
           useDiarize,
-          requestId
+          requestId,
+          useHighAccuracy
         );
       }
 
@@ -190,7 +196,8 @@ export class TranscriptionService {
           filePath,
           language,
           useDiarize,
-          requestId
+          requestId,
+          useHighAccuracy
         );
       }
 
@@ -295,6 +302,7 @@ export class TranscriptionService {
    * @param filePath - Absolute path to the audio file
    * @param options - Additional transcription options
    * @param useDiarize - If true, uses gpt-4o-transcribe-diarize model for speaker diarization
+   * @param useHighAccuracy - If true, uses gpt-4o-transcribe model for higher accuracy (better for background noise, complex dialogues)
    * @returns Transcription result
    */
   async transcribeWithOptions(
@@ -305,13 +313,17 @@ export class TranscriptionService {
       response_format?: "json" | "text" | "srt" | "verbose_json" | "vtt";
       temperature?: number; // 0-1, controls randomness
     },
-    useDiarize?: boolean
+    useDiarize?: boolean,
+    useHighAccuracy?: boolean
   ): Promise<string | any> {
     await this.initialize();
 
     // Determine model outside try block so it's accessible in catch
+    // Priority: diarize > high accuracy > default mini
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
+      : useHighAccuracy
+      ? "gpt-4o-transcribe"
       : "gpt-4o-mini-transcribe";
 
     // Convert to WAV format for better compatibility with new models
@@ -418,10 +430,14 @@ export class TranscriptionService {
     filePath: string,
     language?: string,
     useDiarize?: boolean,
-    requestId?: string
+    requestId?: string,
+    useHighAccuracy?: boolean
   ): Promise<string> {
+    // Priority: diarize > high accuracy > default mini
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
+      : useHighAccuracy
+      ? "gpt-4o-transcribe"
       : "gpt-4o-mini-transcribe";
 
     const logContext: Record<string, any> = {
@@ -529,7 +545,13 @@ export class TranscriptionService {
 
         const batchResults = await Promise.all(
           batch.map((chunkFile) =>
-            this.transcribeSingle(chunkFile, language, useDiarize, requestId)
+            this.transcribeSingle(
+              chunkFile,
+              language,
+              useDiarize,
+              requestId,
+              useHighAccuracy
+            )
           )
         );
         results.push(...batchResults);
@@ -572,10 +594,14 @@ export class TranscriptionService {
     filePath: string,
     language?: string,
     useDiarize?: boolean,
-    requestId?: string
+    requestId?: string,
+    useHighAccuracy?: boolean
   ): Promise<string> {
+    // Priority: diarize > high accuracy > default mini
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
+      : useHighAccuracy
+      ? "gpt-4o-transcribe"
       : "gpt-4o-mini-transcribe";
 
     // Create logger with context
