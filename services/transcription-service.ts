@@ -748,4 +748,95 @@ export class TranscriptionService {
     };
     return mimeTypes[ext || ""] || "audio/mpeg";
   }
+
+  /**
+   * Generate text from transcript using OpenAI Chat Completions API
+   * @param transcript - The transcribed text from audio
+   * @param prompt - The prompt to use for text generation
+   * @param model - Optional model to use (defaults to OPENAI_TEXT_GENERATION_MODEL env var or 'gpt-4o-mini')
+   * @param requestId - Optional request ID for logging context
+   * @returns Generated text
+   */
+  async generateTextFromTranscript(
+    transcript: string,
+    prompt: string,
+    model?: string,
+    requestId?: string
+  ): Promise<string> {
+    await this.initialize();
+
+    // Get model from parameter, environment variable, or default
+    const textGenerationModel =
+      model || process.env.OPENAI_TEXT_GENERATION_MODEL || "gpt-4o-mini";
+
+    // Create logger with context
+    const logContext: Record<string, any> = {
+      textGenerationModel,
+      transcriptLength: transcript.length,
+      promptLength: prompt.length,
+    };
+    if (requestId) logContext.requestId = requestId;
+    const log = createChildLogger(logContext);
+
+    try {
+      log.info("Starting text generation from transcript");
+
+      // Call OpenAI's Chat Completions API
+      const completion = await this.openai.chat.completions.create({
+        model: textGenerationModel,
+        messages: [
+          {
+            role: "user",
+            content: `${prompt}\n\nTranscript:\n${transcript}`,
+          },
+        ],
+      });
+
+      const generatedText =
+        completion.choices[0]?.message?.content?.trim() || "";
+
+      if (!generatedText) {
+        log.warn("Empty response from text generation");
+        throw new Error("Empty response from text generation API");
+      }
+
+      log.info(
+        { generatedTextLength: generatedText.length },
+        "Text generation completed"
+      );
+
+      return generatedText;
+    } catch (error) {
+      log.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        "Text generation error"
+      );
+
+      if (error instanceof Error) {
+        // Handle specific OpenAI API errors
+        if (error.message.includes("API key")) {
+          throw new Error("Invalid or missing OpenAI API key");
+        }
+        if (error.message.includes("rate limit")) {
+          throw new Error(
+            "OpenAI API rate limit exceeded. Please try again later."
+          );
+        }
+        if (error.message.includes("model")) {
+          throw new Error(
+            `Invalid model specified: ${textGenerationModel}. Please check OPENAI_TEXT_GENERATION_MODEL environment variable.`
+          );
+        }
+      }
+
+      throw new Error(
+        `Failed to generate text: ${
+          error instanceof Error ? error.message : "Unknown error"
+        }`
+      );
+    }
+  }
 }

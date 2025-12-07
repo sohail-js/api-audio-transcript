@@ -63,87 +63,122 @@ app.post("/transcribe", async (c: Context) => {
     const { Readable } = await import("stream");
     const { createWriteStream } = await import("fs");
 
-    // Create a promise to handle the file upload
-    const uploadPromise = new Promise<{ filePath: string; filename: string }>(
-      (resolve, reject) => {
-        try {
-          const bb = Busboy({ headers: { "content-type": contentType } });
-          let fileFound = false;
+    // Create a promise to handle the file upload and form fields
+    const uploadPromise = new Promise<{
+      filePath: string;
+      filename: string;
+      prompt?: string;
+    }>((resolve, reject) => {
+      try {
+        const bb = Busboy({ headers: { "content-type": contentType } });
+        let fileFound = false;
+        let prompt: string | undefined;
+        let fileWriteFinished = false;
+        let busboyFinished = false;
+        let resolved = false;
+        let filename: string | undefined;
 
-          bb.on("file", (name, file, info) => {
-            const { filename } = info;
-            requestLogger.debug(
-              { field: name, filename },
-              "Received file field"
-            );
+        const tryResolve = () => {
+          if (resolved) return;
+          if (
+            fileWriteFinished &&
+            busboyFinished &&
+            fileFound &&
+            filename &&
+            tempFilePath
+          ) {
+            resolved = true;
+            resolve({ filePath: tempFilePath, filename, prompt });
+          }
+        };
 
-            if (name !== "audio") {
-              requestLogger.debug({ field: name }, "Skipping non-audio field");
-              file.resume(); // Skip non-audio fields
-              return;
-            }
+        bb.on("file", (name, file, info) => {
+          const fileInfo = info;
+          filename = fileInfo.filename;
+          requestLogger.debug({ field: name, filename }, "Received file field");
 
-            fileFound = true;
-            const ext = getFileExtension(filename) || "mp3";
-            const tempFile = join(tempDir, `transcribe-${uniqueId}.${ext}`);
-            tempFilePath = tempFile;
+          if (name !== "audio") {
+            requestLogger.debug({ field: name }, "Skipping non-audio field");
+            file.resume(); // Skip non-audio fields
+            return;
+          }
 
+          fileFound = true;
+          const ext = getFileExtension(filename) || "mp3";
+          const tempFile = join(tempDir, `transcribe-${uniqueId}.${ext}`);
+          tempFilePath = tempFile;
+
+          requestLogger.info(
+            { tempFilePath: tempFile, filename },
+            "Streaming upload to temporary file"
+          );
+          const writeStream = createWriteStream(tempFile);
+
+          file.pipe(writeStream);
+
+          writeStream.on("finish", () => {
             requestLogger.info(
-              { tempFilePath: tempFile, filename },
-              "Streaming upload to temporary file"
+              { tempFilePath: tempFile },
+              "File write completed"
             );
-            const writeStream = createWriteStream(tempFile);
-
-            file.pipe(writeStream);
-
-            writeStream.on("finish", () => {
-              requestLogger.info(
-                { tempFilePath: tempFile },
-                "File write completed"
-              );
-              resolve({ filePath: tempFile, filename });
-            });
-
-            writeStream.on("error", (err: Error) => {
-              requestLogger.error(
-                { error: err.message, stack: err.stack },
-                "File write error"
-              );
-              reject(err);
-            });
+            fileWriteFinished = true;
+            tryResolve();
           });
 
-          bb.on("error", (err: Error) => {
-            requestLogger.error({ error: err.message }, "Busboy error");
+          writeStream.on("error", (err: Error) => {
+            requestLogger.error(
+              { error: err.message, stack: err.stack },
+              "File write error"
+            );
             reject(err);
           });
+        });
 
-          bb.on("finish", () => {
-            requestLogger.debug("Busboy parsing finished");
-            if (!fileFound) {
-              reject(new Error("No audio file found in request"));
-            }
-          });
-
-          if (c.req.raw.body) {
-            // @ts-ignore
-            const nodeStream = Readable.fromWeb(c.req.raw.body);
-            nodeStream.pipe(bb);
+        bb.on("field", (name, value) => {
+          if (name === "prompt") {
+            prompt = value;
+            requestLogger.debug(
+              { promptLength: value.length },
+              "Received prompt field"
+            );
           } else {
-            reject(new Error("Request body is empty"));
+            requestLogger.debug({ field: name }, "Received non-prompt field");
           }
-        } catch (err) {
-          requestLogger.error(
-            { error: err instanceof Error ? err.message : "Unknown error" },
-            "Upload promise error"
-          );
+        });
+
+        bb.on("error", (err: Error) => {
+          requestLogger.error({ error: err.message }, "Busboy error");
           reject(err);
+        });
+
+        bb.on("finish", () => {
+          requestLogger.debug("Busboy parsing finished");
+          busboyFinished = true;
+          if (!fileFound) {
+            reject(new Error("No audio file found in request"));
+          } else {
+            tryResolve();
+          }
+        });
+
+        if (c.req.raw.body) {
+          // @ts-ignore
+          const nodeStream = Readable.fromWeb(c.req.raw.body);
+          nodeStream.pipe(bb);
+        } else {
+          reject(new Error("Request body is empty"));
         }
+      } catch (err) {
+        requestLogger.error(
+          { error: err instanceof Error ? err.message : "Unknown error" },
+          "Upload promise error"
+        );
+        reject(err);
       }
-    );
+    });
 
     // Wait for upload to complete
-    const { filePath } = await uploadPromise;
+    const { filePath, prompt } = await uploadPromise;
     requestLogger.info({ filePath }, "Upload complete");
 
     // Check for diarize query parameter
@@ -163,6 +198,40 @@ app.post("/transcribe", async (c: Context) => {
       requestId
     );
 
+    // Get text generation model from environment or use default
+    const textGenerationModel =
+      process.env.OPENAI_TEXT_GENERATION_MODEL || "gpt-4o-mini";
+
+    // Generate text from transcript if prompt is provided
+    let generatedText: string | undefined;
+    if (prompt && prompt.trim()) {
+      requestLogger.info(
+        { promptLength: prompt.length },
+        "Prompt provided, generating text from transcript"
+      );
+      try {
+        generatedText = await transcriptionService.generateTextFromTranscript(
+          text,
+          prompt,
+          textGenerationModel,
+          requestId
+        );
+        requestLogger.info(
+          { generatedTextLength: generatedText.length },
+          "Text generation completed"
+        );
+      } catch (error) {
+        requestLogger.error(
+          {
+            error: error instanceof Error ? error.message : "Unknown error",
+            stack: error instanceof Error ? error.stack : undefined,
+          },
+          "Text generation failed, returning transcript only"
+        );
+        // Continue with just the transcript if text generation fails
+      }
+    }
+
     // Calculate processing time
     const processingTimeMs = Date.now() - startTime;
     const processingTimeSeconds = (processingTimeMs / 1000).toFixed(2);
@@ -175,6 +244,7 @@ app.post("/transcribe", async (c: Context) => {
         model: useDiarize
           ? "gpt-4o-transcribe-diarize"
           : "gpt-4o-mini-transcribe",
+        hasGeneratedText: !!generatedText,
       },
       "Transcription completed successfully"
     );
@@ -198,7 +268,8 @@ app.post("/transcribe", async (c: Context) => {
       }
     }
 
-    return c.json({
+    // Build response object
+    const response: any = {
       text,
       processingTimeSeconds: parseFloat(processingTimeSeconds),
       processingTimeMs,
@@ -207,7 +278,15 @@ app.post("/transcribe", async (c: Context) => {
         ? "gpt-4o-transcribe-diarize"
         : "gpt-4o-mini-transcribe",
       diarize: useDiarize,
-    });
+    };
+
+    // Add generated text and model info if prompt was provided
+    if (generatedText) {
+      response.generatedText = generatedText;
+      response.textGenerationModel = textGenerationModel;
+    }
+
+    return c.json(response);
   } catch (error) {
     requestLogger.error(
       {
