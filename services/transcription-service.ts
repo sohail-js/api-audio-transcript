@@ -3,6 +3,7 @@ import { readFile, unlink, stat } from "fs/promises";
 import { basename, join, dirname } from "path";
 import { exec } from "child_process";
 import { promisify } from "util";
+import logger, { createChildLogger } from "../utils/logger.js";
 
 const execAsync = promisify(exec);
 
@@ -15,6 +16,9 @@ const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
 export class TranscriptionService {
   private openai: OpenAI;
   private isInitialized: boolean = false;
+  private serviceLogger = createChildLogger({
+    service: "TranscriptionService",
+  });
 
   constructor() {
     // Initialize OpenAI client with API key from environment variable
@@ -38,9 +42,9 @@ export class TranscriptionService {
       return;
     }
 
-    console.log("Initializing OpenAI Whisper API service...");
+    this.serviceLogger.info("Initializing OpenAI Whisper API service...");
     this.isInitialized = true;
-    console.log("OpenAI Whisper service initialized");
+    this.serviceLogger.info("OpenAI Whisper service initialized");
   }
 
   /**
@@ -48,12 +52,14 @@ export class TranscriptionService {
    * @param filePath - Absolute path to the audio file
    * @param language - Optional language code (e.g., 'hi', 'en', 'ur'). If not provided, auto-detects.
    * @param useDiarize - If true, uses gpt-4o-transcribe-diarize model for speaker diarization
+   * @param requestId - Optional request ID for logging context
    * @returns Transcribed text
    */
   async transcribe(
     filePath: string,
     language?: string,
-    useDiarize?: boolean
+    useDiarize?: boolean,
+    requestId?: string
   ): Promise<string> {
     await this.initialize();
 
@@ -62,17 +68,25 @@ export class TranscriptionService {
       ? "gpt-4o-transcribe-diarize"
       : "gpt-4o-mini-transcribe";
 
+    // Create logger with context
+    const logContext: Record<string, any> = { filePath, model };
+    if (requestId) logContext.requestId = requestId;
+    const log = createChildLogger(logContext);
+
     // Check original file size first
     let convertedFilePath: string | null = null;
     let finalFilePath = filePath;
 
     try {
-      console.log(`Transcribing file: ${filePath} using model: ${model}`);
+      log.info("Starting transcription");
 
       // Check original file size
       const originalStats = await stat(filePath);
       const originalSizeMB = originalStats.size / (1024 * 1024);
-      console.log(`Original file size: ${originalSizeMB.toFixed(2)}MB`);
+      log.info(
+        { originalSizeMB: originalSizeMB.toFixed(2) },
+        "File size checked"
+      );
 
       const fileExt = filePath.split(".").pop()?.toLowerCase();
 
@@ -83,20 +97,25 @@ export class TranscriptionService {
 
       if (originalSizeMB > 25) {
         // File is too large even in original format - must use chunking
-        console.log(
-          `Large file detected (${originalSizeMB.toFixed(
-            2
-          )}MB). Processing in chunks (required due to 25MB file size limit)`
+        log.info(
+          { originalSizeMB: originalSizeMB.toFixed(2) },
+          "Large file detected, processing in chunks (required due to 25MB file size limit)"
         );
-        return await this.transcribeInChunks(filePath, language, useDiarize);
+        return await this.transcribeInChunks(
+          filePath,
+          language,
+          useDiarize,
+          requestId
+        );
       }
 
       // Try original format first (if it's a supported format)
       // This avoids unnecessary conversion and keeps it to 1 API call
       const supportedFormats = ["mp3", "m4a", "wav", "webm", "mpeg", "mpga"];
       if (supportedFormats.includes(fileExt || "")) {
-        console.log(
-          `File is under 25MB and in supported format (${fileExt}). Trying original format first...`
+        log.debug(
+          { fileExt },
+          "File is under 25MB and in supported format, trying original format first"
         );
         try {
           const fileBuffer = await readFile(filePath);
@@ -120,8 +139,9 @@ export class TranscriptionService {
               ? transcription
               : (transcription as any).text || "";
 
-          console.log(
-            `Transcription completed using original format: ${text.length} characters`
+          log.info(
+            { textLength: text.length },
+            "Transcription completed using original format"
           );
           return text.trim();
         } catch (error: any) {
@@ -131,8 +151,9 @@ export class TranscriptionService {
             error.message?.includes("unsupported") ||
             error.message?.includes("file")
           ) {
-            console.log(
-              `Original format failed, converting to WAV: ${error.message}`
+            log.warn(
+              { error: error.message },
+              "Original format failed, converting to WAV"
             );
             // Continue to WAV conversion below
           } else {
@@ -143,10 +164,10 @@ export class TranscriptionService {
 
       // Convert to WAV format if original format didn't work or isn't supported
       if (fileExt !== "wav") {
-        console.log(`Converting ${fileExt} to optimized WAV format...`);
-        convertedFilePath = await this.convertToWav(filePath, true); // optimized
+        log.info({ fileExt }, "Converting to optimized WAV format");
+        convertedFilePath = await this.convertToWav(filePath, true, log); // optimized
         finalFilePath = convertedFilePath;
-        console.log(`Converted to: ${convertedFilePath}`);
+        log.debug({ convertedFilePath }, "File converted to WAV");
       }
 
       // Read the file and create a File object for OpenAI API
@@ -157,16 +178,20 @@ export class TranscriptionService {
       // Double-check file size after conversion
       if (fileSizeMB > 25) {
         // If conversion made it too large, fall back to chunking
-        console.log(
-          `Converted file (${fileSizeMB.toFixed(
-            2
-          )}MB) exceeds 25MB limit. Processing in chunks...`
+        log.info(
+          { fileSizeMB: fileSizeMB.toFixed(2) },
+          "Converted file exceeds 25MB limit, processing in chunks"
         );
         // Clean up converted file
         if (convertedFilePath) {
           await unlink(convertedFilePath).catch(() => {});
         }
-        return await this.transcribeInChunks(filePath, language, useDiarize);
+        return await this.transcribeInChunks(
+          filePath,
+          language,
+          useDiarize,
+          requestId
+        );
       }
 
       // Create File object with WAV MIME type
@@ -175,10 +200,9 @@ export class TranscriptionService {
         lastModified: Date.now(),
       });
 
-      console.log(
-        `File prepared: ${fileName}, size: ${fileSizeMB.toFixed(
-          2
-        )}MB, type: audio/wav`
+      log.debug(
+        { fileName, fileSizeMB: fileSizeMB.toFixed(2), mimeType: "audio/wav" },
+        "File prepared for transcription"
       );
 
       // Call OpenAI's Whisper API
@@ -195,12 +219,18 @@ export class TranscriptionService {
           ? transcription
           : (transcription as any).text || "";
 
-      console.log(`Transcription completed: ${text.length} characters`);
+      log.info({ textLength: text.length }, "Transcription completed");
 
       // Clean up converted file if we created one
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch((err) => {
-          console.warn(`Failed to delete converted file: ${err}`);
+          log.warn(
+            {
+              error: err instanceof Error ? err.message : "Unknown error",
+              convertedFilePath,
+            },
+            "Failed to delete converted file"
+          );
         });
       }
 
@@ -209,11 +239,23 @@ export class TranscriptionService {
       // Clean up converted file if we created one, even on error
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch((err) => {
-          console.warn(`Failed to delete converted file on error: ${err}`);
+          log.warn(
+            {
+              error: err instanceof Error ? err.message : "Unknown error",
+              convertedFilePath,
+            },
+            "Failed to delete converted file on error"
+          );
         });
       }
 
-      console.error("Transcription error:", error);
+      log.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        "Transcription error"
+      );
 
       if (error instanceof Error) {
         // Handle specific OpenAI API errors
@@ -276,18 +318,19 @@ export class TranscriptionService {
     let convertedFilePath: string | null = null;
     let finalFilePath = filePath;
 
+    const logContext: Record<string, any> = { filePath, model };
+    const log = createChildLogger(logContext);
+
     try {
-      console.log(
-        `Transcribing file with options: ${filePath} using model: ${model}`
-      );
+      log.info("Starting transcription with options");
 
       // Convert to WAV format for better compatibility
       const fileExt = filePath.split(".").pop()?.toLowerCase();
       if (fileExt !== "wav") {
-        console.log(`Converting ${fileExt} to WAV format for compatibility...`);
-        convertedFilePath = await this.convertToWav(filePath);
+        log.info({ fileExt }, "Converting to WAV format for compatibility");
+        convertedFilePath = await this.convertToWav(filePath, false, log);
         finalFilePath = convertedFilePath;
-        console.log(`Converted to: ${convertedFilePath}`);
+        log.debug({ convertedFilePath }, "File converted to WAV");
       }
 
       // Read the converted file and create a File object for OpenAI API
@@ -324,7 +367,13 @@ export class TranscriptionService {
       // Clean up converted file if we created one
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch((err) => {
-          console.warn(`Failed to delete converted file: ${err}`);
+          log.warn(
+            {
+              error: err instanceof Error ? err.message : "Unknown error",
+              convertedFilePath,
+            },
+            "Failed to delete converted file"
+          );
         });
       }
 
@@ -333,11 +382,23 @@ export class TranscriptionService {
       // Clean up converted file if we created one, even on error
       if (convertedFilePath) {
         await unlink(convertedFilePath).catch((err) => {
-          console.warn(`Failed to delete converted file on error: ${err}`);
+          log.warn(
+            {
+              error: err instanceof Error ? err.message : "Unknown error",
+              convertedFilePath,
+            },
+            "Failed to delete converted file on error"
+          );
         });
       }
 
-      console.error("Transcription error:", error);
+      log.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        "Transcription error"
+      );
       throw new Error(
         `Failed to transcribe: ${
           error instanceof Error ? error.message : "Unknown error"
@@ -356,25 +417,36 @@ export class TranscriptionService {
   private async transcribeInChunks(
     filePath: string,
     language?: string,
-    useDiarize?: boolean
+    useDiarize?: boolean,
+    requestId?: string
   ): Promise<string> {
     const model = useDiarize
       ? "gpt-4o-transcribe-diarize"
       : "gpt-4o-mini-transcribe";
+
+    const logContext: Record<string, any> = {
+      filePath,
+      model,
+      operation: "transcribeInChunks",
+    };
+    if (requestId) logContext.requestId = requestId;
+    const log = createChildLogger(logContext);
 
     try {
       // Get audio duration to calculate chunk size
       const duration = await this.getAudioDuration(filePath);
       const fileStats = await stat(filePath);
       const fileSizeBytes = fileStats.size;
+      const durationMinutes = (duration / 60).toFixed(2);
+      const estimatedCost = ((duration / 60) * 0.006).toFixed(4);
 
-      console.log(
-        `Large file detected. Duration: ${(duration / 60).toFixed(
-          2
-        )} minutes. ` +
-          `Estimated cost: $${((duration / 60) * 0.006).toFixed(
-            4
-          )} (same regardless of chunking)`
+      log.info(
+        {
+          durationMinutes: parseFloat(durationMinutes),
+          fileSizeBytes,
+          estimatedCost: parseFloat(estimatedCost),
+        },
+        "Large file detected, estimated cost (same regardless of chunking)"
       );
 
       // Estimate bytes per second to calculate safe chunk duration
@@ -399,13 +471,12 @@ export class TranscriptionService {
       );
       const numChunks = Math.ceil(duration / actualChunkDuration);
 
-      console.log(
-        `Splitting into ${numChunks} chunks of ~${actualChunkDuration}s each ` +
-          `(required due to 25MB file size limit, cost remains the same)`
-      );
-
-      console.log(
-        `Splitting into ${numChunks} chunks of ~${actualChunkDuration}s each`
+      log.info(
+        {
+          numChunks,
+          chunkDuration: actualChunkDuration,
+        },
+        "Splitting into chunks (required due to 25MB file size limit, cost remains the same)"
       );
 
       // Create chunk files
@@ -421,8 +492,9 @@ export class TranscriptionService {
         );
       }
 
-      console.log(
-        `Created ${chunkFiles.length} chunk files, processing in parallel...`
+      log.info(
+        { chunkCount: chunkFiles.length },
+        "Created chunk files, processing in parallel"
       );
 
       // Process chunks in parallel (max 2 at a time to avoid rate limits)
@@ -431,10 +503,16 @@ export class TranscriptionService {
 
       for (let i = 0; i < chunkFiles.length; i += maxConcurrent) {
         const batch = chunkFiles.slice(i, i + maxConcurrent);
-        console.log(
-          `Processing batch ${Math.ceil((i + 1) / maxConcurrent)}/${Math.ceil(
-            chunkFiles.length / maxConcurrent
-          )} (Chunks ${i}-${i + batch.length - 1})`
+        const batchNum = Math.ceil((i + 1) / maxConcurrent);
+        const totalBatches = Math.ceil(chunkFiles.length / maxConcurrent);
+        log.info(
+          {
+            batchNum,
+            totalBatches,
+            chunkStart: i,
+            chunkEnd: i + batch.length - 1,
+          },
+          "Processing batch"
         );
 
         const batchResults = await Promise.all(
@@ -450,13 +528,23 @@ export class TranscriptionService {
 
       // Combine results
       const combinedText = results.filter((r) => r.length > 0).join(" ");
-      console.log(
-        `Combined transcription: ${combinedText.length} characters from ${results.length} chunks`
+      log.info(
+        {
+          combinedTextLength: combinedText.length,
+          chunkCount: results.length,
+        },
+        "Combined transcription from chunks"
       );
 
       return combinedText;
     } catch (error) {
-      console.error("Error in transcribeInChunks:", error);
+      log.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+        },
+        "Error in transcribeInChunks"
+      );
       throw new Error(
         `Failed to transcribe in chunks: ${
           error instanceof Error ? error.message : "Unknown error"
@@ -545,12 +633,21 @@ export class TranscriptionService {
       );
       const duration = parseFloat(stdout.trim());
       if (isNaN(duration)) {
-        console.warn("Could not parse audio duration, defaulting to estimate");
+        this.serviceLogger.warn(
+          { filePath },
+          "Could not parse audio duration, defaulting to estimate"
+        );
         return 0;
       }
       return duration;
     } catch (error) {
-      console.warn("Could not determine audio duration:", error);
+      this.serviceLogger.warn(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          filePath,
+        },
+        "Could not determine audio duration"
+      );
       return 0;
     }
   }
@@ -559,11 +656,13 @@ export class TranscriptionService {
    * Convert audio file to WAV format using ffmpeg
    * @param filePath - Path to the input audio file
    * @param optimized - If true, uses lower sample rate to reduce file size (8kHz instead of 16kHz)
+   * @param log - Optional logger instance for logging
    * @returns Path to the converted WAV file
    */
   private async convertToWav(
     filePath: string,
-    optimized: boolean = false
+    optimized: boolean = false,
+    log?: ReturnType<typeof createChildLogger>
   ): Promise<string> {
     const outputPath = filePath.replace(/\.[^.]+$/, ".wav");
 
@@ -578,12 +677,19 @@ export class TranscriptionService {
         `ffmpeg -i "${filePath}" -ar ${sampleRate} -ac 1 -c:a pcm_s16le "${outputPath}" -y`
       );
 
-      console.log(
-        `Successfully converted to WAV (${sampleRate}Hz): ${outputPath}`
-      );
+      const logger = log || this.serviceLogger;
+      logger.info({ sampleRate, outputPath }, "Successfully converted to WAV");
       return outputPath;
     } catch (error) {
-      console.error(`Failed to convert file to WAV:`, error);
+      const logger = log || this.serviceLogger;
+      logger.error(
+        {
+          error: error instanceof Error ? error.message : "Unknown error",
+          stack: error instanceof Error ? error.stack : undefined,
+          filePath,
+        },
+        "Failed to convert file to WAV"
+      );
       throw new Error(
         `Failed to convert audio file to WAV format: ${
           error instanceof Error ? error.message : "Unknown error"

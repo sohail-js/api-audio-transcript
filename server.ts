@@ -4,8 +4,10 @@ import "dotenv/config";
 import { serve } from "@hono/node-server";
 import { Hono, Context } from "hono";
 import { TranscriptionService } from "./services/transcription-service.js";
-import { mkdir } from "fs/promises";
+import { unlink } from "fs/promises";
 import { join } from "path";
+import { tmpdir } from "os";
+import logger, { createChildLogger } from "./utils/logger.js";
 
 // Initialize service
 let transcriptionService: TranscriptionService;
@@ -14,12 +16,18 @@ try {
   transcriptionService = new TranscriptionService();
   // Initialize at startup
   transcriptionService.initialize().catch((error) => {
-    console.error("Failed to initialize OpenAI Whisper service:", error);
+    logger.error(
+      { error: error.message, stack: error.stack },
+      "Failed to initialize OpenAI Whisper service"
+    );
     process.exit(1);
   });
 } catch (error) {
-  console.error("Failed to create TranscriptionService:", error);
-  console.error("Please ensure OPENAI_API_KEY environment variable is set");
+  logger.error(
+    { error: error instanceof Error ? error.message : "Unknown error" },
+    "Failed to create TranscriptionService"
+  );
+  logger.error("Please ensure OPENAI_API_KEY environment variable is set");
   process.exit(1);
 }
 
@@ -27,26 +35,28 @@ const app = new Hono();
 
 // POST /transcribe endpoint
 app.post("/transcribe", async (c: Context) => {
-  let requestDir: string | null = null;
+  let tempFilePath: string | null = null;
   const startTime = Date.now();
+  const requestId = `req-${Date.now()}-${Math.random()
+    .toString(36)
+    .substring(2, 7)}`;
+  const requestLogger = createChildLogger({ requestId });
 
   try {
+    requestLogger.info("Transcription request started");
+
     // Check Content-Type
     const contentType = c.req.header("content-type");
     if (!contentType || !contentType.includes("multipart/form-data")) {
+      requestLogger.warn("Invalid Content-Type");
       return c.json({ error: "Content-Type must be multipart/form-data" }, 400);
     }
 
-    // Prepare requests directory
-    const projectRoot = process.cwd();
-    const requestsBaseDir = join(projectRoot, "requests");
-    const requestId = `req-${Date.now()}-${Math.random()
+    // Use OS temporary directory for file storage
+    const tempDir = tmpdir();
+    const uniqueId = `${Date.now()}-${Math.random()
       .toString(36)
-      .substring(2, 7)}`;
-    requestDir = join(requestsBaseDir, requestId);
-
-    await mkdir(requestDir, { recursive: true });
-    console.log(`Created request directory: ${requestDir}`);
+      .substring(2, 9)}`;
 
     // Use Busboy for streaming file upload
     const { default: Busboy } = await import("busboy");
@@ -62,41 +72,54 @@ app.post("/transcribe", async (c: Context) => {
 
           bb.on("file", (name, file, info) => {
             const { filename } = info;
-            console.log(`Received file field: ${name}, filename: ${filename}`);
+            requestLogger.debug(
+              { field: name, filename },
+              "Received file field"
+            );
 
             if (name !== "audio") {
-              console.log(`Skipping field: ${name}`);
+              requestLogger.debug({ field: name }, "Skipping non-audio field");
               file.resume(); // Skip non-audio fields
               return;
             }
 
             fileFound = true;
             const ext = getFileExtension(filename) || "mp3";
-            const savePath = join(requestDir!, `original.${ext}`);
+            const tempFile = join(tempDir, `transcribe-${uniqueId}.${ext}`);
+            tempFilePath = tempFile;
 
-            console.log(`Streaming upload to: ${savePath}`);
-            const writeStream = createWriteStream(savePath);
+            requestLogger.info(
+              { tempFilePath: tempFile, filename },
+              "Streaming upload to temporary file"
+            );
+            const writeStream = createWriteStream(tempFile);
 
             file.pipe(writeStream);
 
             writeStream.on("finish", () => {
-              console.log("File write completed");
-              resolve({ filePath: savePath, filename });
+              requestLogger.info(
+                { tempFilePath: tempFile },
+                "File write completed"
+              );
+              resolve({ filePath: tempFile, filename });
             });
 
-            writeStream.on("error", (err) => {
-              console.error("File write error:", err);
+            writeStream.on("error", (err: Error) => {
+              requestLogger.error(
+                { error: err.message, stack: err.stack },
+                "File write error"
+              );
               reject(err);
             });
           });
 
-          bb.on("error", (err) => {
-            console.error("Busboy error:", err);
+          bb.on("error", (err: Error) => {
+            requestLogger.error({ error: err.message }, "Busboy error");
             reject(err);
           });
 
           bb.on("finish", () => {
-            console.log("Busboy parsing finished");
+            requestLogger.debug("Busboy parsing finished");
             if (!fileFound) {
               reject(new Error("No audio file found in request"));
             }
@@ -110,6 +133,10 @@ app.post("/transcribe", async (c: Context) => {
             reject(new Error("Request body is empty"));
           }
         } catch (err) {
+          requestLogger.error(
+            { error: err instanceof Error ? err.message : "Unknown error" },
+            "Upload promise error"
+          );
           reject(err);
         }
       }
@@ -117,7 +144,7 @@ app.post("/transcribe", async (c: Context) => {
 
     // Wait for upload to complete
     const { filePath } = await uploadPromise;
-    console.log(`Upload complete: ${filePath}`);
+    requestLogger.info({ filePath }, "Upload complete");
 
     // Check for diarize query parameter
     const diarizeParam = c.req.query("diarize");
@@ -125,42 +152,102 @@ app.post("/transcribe", async (c: Context) => {
       diarizeParam === "true" || diarizeParam === "1" || diarizeParam === "yes";
 
     if (useDiarize) {
-      console.log("Speaker diarization enabled via query parameter");
+      requestLogger.info("Speaker diarization enabled via query parameter");
     }
 
-    // Transcribe audio
+    // Transcribe audio (pass requestId for logging context)
     const text = await transcriptionService.transcribe(
       filePath,
       undefined,
-      useDiarize
+      useDiarize,
+      requestId
     );
 
     // Calculate processing time
     const processingTimeMs = Date.now() - startTime;
     const processingTimeSeconds = (processingTimeMs / 1000).toFixed(2);
 
+    requestLogger.info(
+      {
+        processingTimeMs,
+        processingTimeSeconds: parseFloat(processingTimeSeconds),
+        textLength: text.length,
+        model: useDiarize
+          ? "gpt-4o-transcribe-diarize"
+          : "gpt-4o-mini-transcribe",
+      },
+      "Transcription completed successfully"
+    );
+
+    // Clean up temporary file
+    if (tempFilePath) {
+      try {
+        await unlink(tempFilePath);
+        requestLogger.debug({ tempFilePath }, "Temporary file cleaned up");
+      } catch (cleanupError) {
+        requestLogger.warn(
+          {
+            error:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : "Unknown error",
+            tempFilePath,
+          },
+          "Failed to clean up temporary file"
+        );
+      }
+    }
+
     return c.json({
       text,
       processingTimeSeconds: parseFloat(processingTimeSeconds),
       processingTimeMs,
       requestId,
-      debugPath: requestDir,
       model: useDiarize
         ? "gpt-4o-transcribe-diarize"
         : "gpt-4o-mini-transcribe",
       diarize: useDiarize,
     });
   } catch (error) {
-    console.error("Transcription error:", error);
+    requestLogger.error(
+      {
+        error: error instanceof Error ? error.message : "Unknown error",
+        stack: error instanceof Error ? error.stack : undefined,
+      },
+      "Transcription error"
+    );
+
+    // Clean up temporary file on error
+    if (tempFilePath) {
+      try {
+        await unlink(tempFilePath);
+        requestLogger.debug(
+          { tempFilePath },
+          "Temporary file cleaned up after error"
+        );
+      } catch (cleanupError) {
+        requestLogger.warn(
+          {
+            error:
+              cleanupError instanceof Error
+                ? cleanupError.message
+                : "Unknown error",
+            tempFilePath,
+          },
+          "Failed to clean up temporary file after error"
+        );
+      }
+    }
+
     return c.json(
       {
         error: "Failed to transcribe audio",
         details: error instanceof Error ? error.message : "Unknown error",
+        requestId,
       },
       500
     );
   }
-  // NOTE: Cleanup removed for debugging purposes as requested
 });
 
 // Health check endpoint
@@ -183,9 +270,9 @@ function getFileExtension(filename: string): string | null {
 }
 
 const port = 3001;
-console.log(`Server is running on port ${port}`);
-console.log(`Using OpenAI Whisper API (gpt-4o-mini-transcribe model)`);
-console.log(`Make sure OPENAI_API_KEY environment variable is set`);
+logger.info({ port }, "Server starting");
+logger.info("Using OpenAI Whisper API (gpt-4o-mini-transcribe model)");
+logger.info("Make sure OPENAI_API_KEY environment variable is set");
 
 serve({
   fetch: app.fetch,
