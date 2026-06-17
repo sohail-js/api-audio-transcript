@@ -29,6 +29,7 @@ type TranscriptionResult = {
   model: string;
   diarize: boolean;
   accurate: boolean;
+  language?: string;
   textGenerationModel?: string;
 };
 
@@ -119,8 +120,13 @@ app.post("/transcribe", async (c: Context) => {
 // POST /transcribe/stream endpoint
 app.post("/transcribe/stream", streamTranscription);
 
-// Health check endpoint
+// Simple browser UI
 app.get("/", (c: Context) => {
+  return c.html(uiHtml);
+});
+
+// Health check endpoint
+app.get("/health", (c: Context) => {
   return c.json({
     message: "OpenAI Whisper Transcription API",
     status: "ok",
@@ -296,6 +302,7 @@ async function runTranscription(
 ): Promise<TranscriptionResult> {
   const useDiarize = isTruthy(c.req.query("diarize"));
   const useHighAccuracy = isTruthy(c.req.query("accurate"));
+  const language = c.req.query("language")?.trim() || undefined;
 
   if (useDiarize) {
     requestLogger.info("Speaker diarization enabled via query parameter");
@@ -309,7 +316,7 @@ async function runTranscription(
 
   const text = await transcriptionService.transcribe(
     upload.filePath,
-    undefined,
+    language,
     useDiarize,
     requestId,
     useHighAccuracy,
@@ -380,6 +387,10 @@ async function runTranscription(
     accurate: useHighAccuracy,
   };
 
+  if (language) {
+    result.language = language;
+  }
+
   if (generatedText) {
     result.generatedText = generatedText;
     result.textGenerationModel = textGenerationModel;
@@ -387,6 +398,492 @@ async function runTranscription(
 
   return result;
 }
+
+const uiHtml = String.raw`<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Audio Transcription</title>
+    <style>
+      :root {
+        color-scheme: light;
+        --bg: #f7f8fa;
+        --panel: #ffffff;
+        --text: #172033;
+        --muted: #627084;
+        --line: #d9dee8;
+        --accent: #1f6feb;
+        --accent-dark: #1557b0;
+        --ok: #138a43;
+        --danger: #b42318;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--bg);
+        color: var(--text);
+        font-family: Arial, Helvetica, sans-serif;
+      }
+
+      main {
+        width: min(960px, calc(100% - 32px));
+        margin: 0 auto;
+        padding: 32px 0;
+      }
+
+      header {
+        margin-bottom: 20px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: clamp(28px, 5vw, 42px);
+        line-height: 1.05;
+        letter-spacing: 0;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.5;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+        gap: 18px;
+        align-items: start;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 18px;
+      }
+
+      label,
+      legend {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 700;
+        font-size: 14px;
+      }
+
+      input[type="file"],
+      select,
+      textarea {
+        width: 100%;
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        background: #fff;
+        color: var(--text);
+        font: inherit;
+      }
+
+      input[type="file"],
+      select {
+        min-height: 42px;
+        padding: 9px 10px;
+      }
+
+      textarea {
+        min-height: 124px;
+        padding: 10px;
+        resize: vertical;
+        line-height: 1.5;
+      }
+
+      .field {
+        margin-bottom: 16px;
+      }
+
+      fieldset {
+        border: 0;
+        padding: 0;
+        margin: 0 0 16px;
+      }
+
+      .check {
+        display: flex;
+        gap: 10px;
+        align-items: flex-start;
+        margin: 10px 0;
+        color: var(--text);
+      }
+
+      .check input {
+        margin-top: 2px;
+      }
+
+      .check span {
+        color: var(--muted);
+        display: block;
+        font-size: 13px;
+        margin-top: 2px;
+      }
+
+      button {
+        border: 0;
+        border-radius: 6px;
+        background: var(--accent);
+        color: #fff;
+        cursor: pointer;
+        font: inherit;
+        font-weight: 700;
+        min-height: 42px;
+        padding: 10px 14px;
+      }
+
+      button:hover:not(:disabled) {
+        background: var(--accent-dark);
+      }
+
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.65;
+      }
+
+      .secondary {
+        background: #eef2f8;
+        color: var(--text);
+      }
+
+      .secondary:hover:not(:disabled) {
+        background: #dfe6f1;
+      }
+
+      .actions {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      .progress-wrap {
+        margin-bottom: 16px;
+      }
+
+      .progress-meta {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        margin-bottom: 8px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .progress {
+        height: 12px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: #e8edf5;
+      }
+
+      .bar {
+        width: 0%;
+        height: 100%;
+        background: var(--accent);
+        transition: width 180ms ease;
+      }
+
+      .status {
+        min-height: 22px;
+        margin-bottom: 14px;
+        color: var(--muted);
+      }
+
+      .status.error {
+        color: var(--danger);
+      }
+
+      .status.done {
+        color: var(--ok);
+      }
+
+      .result-heading {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 8px;
+      }
+
+      .result-heading h2 {
+        margin: 0;
+        font-size: 18px;
+      }
+
+      #output {
+        min-height: 360px;
+      }
+
+      .details {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 760px) {
+        main {
+          width: min(100% - 24px, 960px);
+          padding: 20px 0;
+        }
+
+        .layout {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Audio Transcription</h1>
+        <p>Upload an audio file, choose the options you need, and watch the transcription progress.</p>
+      </header>
+
+      <div class="layout">
+        <form id="form" class="panel">
+          <div class="field">
+            <label for="audio">Audio file</label>
+            <input id="audio" name="audio" type="file" accept="audio/*,.mp3,.wav,.m4a,.flac,.ogg,.webm,.opus" required />
+          </div>
+
+          <div class="field">
+            <label for="language">Language</label>
+            <select id="language" name="language">
+              <option value="">Auto detect</option>
+              <option value="en">English</option>
+              <option value="hi">Hindi</option>
+              <option value="ur">Urdu</option>
+              <option value="ar">Arabic</option>
+              <option value="es">Spanish</option>
+              <option value="fr">French</option>
+              <option value="de">German</option>
+            </select>
+          </div>
+
+          <fieldset>
+            <legend>Model options</legend>
+            <label class="check">
+              <input id="accurate" type="checkbox" />
+              <span><strong>High accuracy</strong><br />Use gpt-4o-transcribe for noisy or complex audio.</span>
+            </label>
+            <label class="check">
+              <input id="diarize" type="checkbox" />
+              <span><strong>Speaker diarization</strong><br />Label multiple speakers. This takes priority over high accuracy.</span>
+            </label>
+          </fieldset>
+
+          <div class="field">
+            <label for="prompt">Optional follow-up prompt</label>
+            <textarea id="prompt" name="prompt" placeholder="Example: Summarize the transcript as meeting notes."></textarea>
+          </div>
+
+          <div class="actions">
+            <button id="submit" type="submit">Transcribe</button>
+            <button id="reset" class="secondary" type="button">Reset</button>
+          </div>
+        </form>
+
+        <section class="panel">
+          <div class="progress-wrap">
+            <div class="progress-meta">
+              <span id="stage">Waiting for upload</span>
+              <strong id="percent">0%</strong>
+            </div>
+            <div class="progress" aria-label="Transcription progress">
+              <div id="bar" class="bar"></div>
+            </div>
+          </div>
+
+          <div id="status" class="status">Choose an audio file to begin.</div>
+
+          <div class="result-heading">
+            <h2>Transcript</h2>
+            <button id="copy" class="secondary" type="button" disabled>Copy</button>
+          </div>
+          <textarea id="output" readonly placeholder="The final transcript will appear here."></textarea>
+          <div id="details" class="details"></div>
+        </section>
+      </div>
+    </main>
+
+    <script>
+      const form = document.getElementById("form");
+      const audio = document.getElementById("audio");
+      const language = document.getElementById("language");
+      const accurate = document.getElementById("accurate");
+      const diarize = document.getElementById("diarize");
+      const promptInput = document.getElementById("prompt");
+      const submit = document.getElementById("submit");
+      const reset = document.getElementById("reset");
+      const copy = document.getElementById("copy");
+      const bar = document.getElementById("bar");
+      const percent = document.getElementById("percent");
+      const stage = document.getElementById("stage");
+      const status = document.getElementById("status");
+      const output = document.getElementById("output");
+      const details = document.getElementById("details");
+
+      function setProgress(value, label, message) {
+        const completed = Math.max(0, Math.min(100, Number(value) || 0));
+        bar.style.width = completed + "%";
+        percent.textContent = Math.round(completed) + "%";
+        if (label) stage.textContent = label;
+        if (message) status.textContent = message;
+      }
+
+      function setBusy(isBusy) {
+        submit.disabled = isBusy;
+        audio.disabled = isBusy;
+        language.disabled = isBusy;
+        accurate.disabled = isBusy;
+        diarize.disabled = isBusy;
+        promptInput.disabled = isBusy;
+      }
+
+      function resetOutput() {
+        setProgress(0, "Waiting for upload", "Choose an audio file to begin.");
+        status.className = "status";
+        output.value = "";
+        details.textContent = "";
+        copy.disabled = true;
+      }
+
+      function parseSseBlock(block) {
+        let event = "message";
+        const dataLines = [];
+
+        for (const line of block.split("\n")) {
+          if (line.startsWith("event:")) event = line.slice(6).trim();
+          if (line.startsWith("data:")) dataLines.push(line.slice(5).trim());
+        }
+
+        if (!dataLines.length) return null;
+        return { event, data: JSON.parse(dataLines.join("\n")) };
+      }
+
+      async function handleStream(response) {
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { value, done } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const blocks = buffer.split("\n\n");
+          buffer = blocks.pop() || "";
+
+          for (const block of blocks) {
+            const message = parseSseBlock(block.trim());
+            if (!message) continue;
+
+            if (message.event === "progress") {
+              const chunkInfo = message.data.totalChunks
+                ? " (" + (message.data.currentChunk || 0) + "/" + message.data.totalChunks + " chunks)"
+                : "";
+              setProgress(
+                message.data.completed,
+                message.data.stage || "Working",
+                (message.data.message || "Processing") + chunkInfo
+              );
+
+              if (message.data.chunkText) {
+                const heading = "Chunk " + message.data.currentChunk + " of " + message.data.totalChunks;
+                const separator = output.value.trim() ? "\n\n" : "";
+                output.value += separator + "[" + heading + "]\n" + message.data.chunkText;
+                copy.disabled = false;
+              }
+            }
+
+            if (message.event === "completed") {
+              setProgress(100, "Completed", "Transcription completed.");
+              status.className = "status done";
+              output.value = message.data.generatedText || message.data.text || "";
+              copy.disabled = !output.value;
+
+              const parts = [
+                "Model: " + message.data.model,
+                "Request: " + message.data.requestId,
+                "Time: " + message.data.processingTimeSeconds + "s"
+              ];
+              if (message.data.language) parts.push("Language: " + message.data.language);
+              if (message.data.generatedText) parts.push("Showing generated output from your prompt");
+              details.textContent = parts.join(" | ");
+            }
+
+            if (message.event === "error") {
+              throw new Error(message.data.details || message.data.error || "Transcription failed");
+            }
+          }
+        }
+      }
+
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        resetOutput();
+
+        if (!audio.files.length) {
+          status.className = "status error";
+          status.textContent = "Please choose an audio file first.";
+          return;
+        }
+
+        const formData = new FormData();
+        formData.append("audio", audio.files[0]);
+        if (promptInput.value.trim()) formData.append("prompt", promptInput.value.trim());
+
+        const params = new URLSearchParams();
+        if (language.value) params.set("language", language.value);
+        if (accurate.checked) params.set("accurate", "true");
+        if (diarize.checked) params.set("diarize", "true");
+
+        setBusy(true);
+        setProgress(1, "Uploading", "Uploading audio file...");
+
+        try {
+          const url = "/transcribe/stream" + (params.toString() ? "?" + params.toString() : "");
+          const response = await fetch(url, { method: "POST", body: formData });
+
+          if (!response.ok || !response.body) {
+            throw new Error("Server returned " + response.status + " " + response.statusText);
+          }
+
+          await handleStream(response);
+        } catch (error) {
+          status.className = "status error";
+          status.textContent = error instanceof Error ? error.message : "Transcription failed.";
+        } finally {
+          setBusy(false);
+        }
+      });
+
+      reset.addEventListener("click", () => {
+        form.reset();
+        resetOutput();
+      });
+
+      copy.addEventListener("click", async () => {
+        await navigator.clipboard.writeText(output.value);
+        const original = copy.textContent;
+        copy.textContent = "Copied";
+        setTimeout(() => {
+          copy.textContent = original;
+        }, 1200);
+      });
+    </script>
+  </body>
+</html>`;
 
 async function cleanupTempFile(
   tempFilePath: string | null,
@@ -533,7 +1030,7 @@ function streamTranscription(c: Context): Response {
   });
 }
 
-const port = 3001;
+const port = Number(process.env.PORT) || 3001;
 logger.info({ port }, "Server starting");
 logger.info("Using OpenAI Whisper API (gpt-4o-mini-transcribe model)");
 logger.info("Make sure OPENAI_API_KEY environment variable is set");

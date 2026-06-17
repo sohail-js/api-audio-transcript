@@ -54,7 +54,15 @@ Or use the dev script for auto-reload:
 npm run dev
 ```
 
-The server will start on `http://localhost:3001`.
+The server will start on `http://localhost:3001` by default. To use another port:
+
+```bash
+PORT=3002 npm start
+```
+
+Open the browser UI at `http://localhost:3001` to upload audio, choose transcription options, watch streaming progress, see completed chunks as they return, and copy the final output.
+
+The JSON health check is available at `http://localhost:3001/health`.
 
 ## API Endpoints
 

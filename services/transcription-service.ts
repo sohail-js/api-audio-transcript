@@ -1,14 +1,16 @@
 import OpenAI from "openai";
 import { readFile, unlink, stat } from "fs/promises";
 import { basename, join, dirname } from "path";
-import { exec } from "child_process";
+import { execFile } from "child_process";
 import { promisify } from "util";
 import logger, { createChildLogger } from "../utils/logger.js";
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 // OpenAI Whisper API file size limit: 25MB
 const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
+const OPTIMIZED_WAV_SAMPLE_RATE = 8000;
+const OPTIMIZED_WAV_BYTES_PER_SECOND = OPTIMIZED_WAV_SAMPLE_RATE * 2; // 16-bit mono PCM
 
 export type TranscriptionProgress = {
   completed: number;
@@ -16,6 +18,7 @@ export type TranscriptionProgress = {
   message: string;
   currentChunk?: number;
   totalChunks?: number;
+  chunkText?: string;
 };
 
 type ProgressCallback = (progress: TranscriptionProgress) => void;
@@ -506,9 +509,32 @@ export class TranscriptionService {
     if (requestId) logContext.requestId = requestId;
     const log = createChildLogger(logContext);
 
+    const chunkFiles: string[] = [];
+    let chunkSourcePath = filePath;
+    let convertedChunkSourcePath: string | null = null;
+
     try {
       // Get audio duration to calculate chunk size
-      const duration = await this.getAudioDuration(filePath);
+      let duration = await this.getAudioDuration(chunkSourcePath);
+
+      if (
+        (!duration || duration <= 0 || !isFinite(duration)) &&
+        !filePath.toLowerCase().endsWith(".wav")
+      ) {
+        log.warn(
+          { filePath },
+          "Could not determine duration from original file, converting to WAV before chunking"
+        );
+        onProgress?.({
+          completed: 15,
+          stage: "converting",
+          message: "Preparing audio for chunking",
+        });
+        convertedChunkSourcePath = await this.convertToWav(filePath, true, log);
+        chunkSourcePath = convertedChunkSourcePath;
+        duration = await this.getAudioDuration(chunkSourcePath);
+      }
+
       onProgress?.({
         completed: 15,
         stage: "analyzing",
@@ -518,7 +544,7 @@ export class TranscriptionService {
       // Validate duration - must be positive to calculate chunk sizes
       if (!duration || duration <= 0 || !isFinite(duration)) {
         log.error(
-          { duration, filePath },
+          { duration, filePath: chunkSourcePath },
           "Invalid or zero audio duration, cannot process in chunks"
         );
         throw new Error(
@@ -526,7 +552,7 @@ export class TranscriptionService {
         );
       }
 
-      const fileStats = await stat(filePath);
+      const fileStats = await stat(chunkSourcePath);
       const fileSizeBytes = fileStats.size;
       const durationMinutes = (duration / 60).toFixed(2);
       const estimatedCost = ((duration / 60) * 0.006).toFixed(4);
@@ -540,25 +566,17 @@ export class TranscriptionService {
         "Large file detected, estimated cost (same regardless of chunking)"
       );
 
-      // Estimate bytes per second to calculate safe chunk duration
-      // Use 80% of limit to be safe (20MB per chunk)
+      // Estimate chunk duration from optimized WAV output size, not compressed input size.
+      // 8kHz 16-bit mono PCM is about 16KB/s, so 10-minute chunks stay around 9.6MB.
       const safeChunkSizeBytes = MAX_FILE_SIZE_BYTES * 0.8;
-      const bytesPerSecond = fileSizeBytes / duration;
-      const chunkDuration = Math.floor(safeChunkSizeBytes / bytesPerSecond);
-
-      // Use optimized WAV conversion (8kHz) which reduces file size by ~50%
-      // This allows larger chunks, reducing processing overhead (cost is the same)
-      // Estimate: optimized WAV is ~6x larger than compressed (vs 12x for standard WAV)
-      const optimizedWavMultiplier = 6;
       const optimizedChunkDuration = Math.floor(
-        chunkDuration / optimizedWavMultiplier
+        safeChunkSizeBytes / OPTIMIZED_WAV_BYTES_PER_SECOND
       );
 
-      // Minimum chunk duration of 60 seconds, maximum of 5 minutes
-      // Optimized WAV allows larger chunks, reducing processing overhead
+      // Minimum chunk duration of 60 seconds, maximum of 10 minutes.
       const actualChunkDuration = Math.max(
         60,
-        Math.min(optimizedChunkDuration, 300)
+        Math.min(optimizedChunkDuration, 600)
       );
       const numChunks = Math.ceil(duration / actualChunkDuration);
 
@@ -577,15 +595,19 @@ export class TranscriptionService {
       });
 
       // Create chunk files
-      const chunkFiles: string[] = [];
       for (let i = 0; i < numChunks; i++) {
         const startTime = i * actualChunkDuration;
-        const chunkFile = filePath.replace(/(\.[^.]+)$/, `_chunk${i}$1`);
+        const chunkFile = chunkSourcePath.replace(
+          /(\.[^.]+)$/,
+          `_chunk${i}.wav`
+        );
         chunkFiles.push(chunkFile);
 
-        // Extract chunk using ffmpeg (copy codec to avoid re-encoding)
-        await execAsync(
-          `ffmpeg -i "${filePath}" -ss ${startTime} -t ${actualChunkDuration} -c copy "${chunkFile}" -y`
+        await this.createOptimizedWavChunk(
+          chunkSourcePath,
+          chunkFile,
+          startTime,
+          actualChunkDuration
         );
       }
 
@@ -619,28 +641,40 @@ export class TranscriptionService {
         );
 
         const batchResults = await Promise.all(
-          batch.map((chunkFile) =>
-            this.transcribeSingle(
+          batch.map(async (chunkFile, batchIndex) => {
+            const text = await this.transcribeSingle(
               chunkFile,
               language,
               useDiarize,
               requestId,
               useHighAccuracy
-            )
-          )
-        );
-        results.push(...batchResults);
-        onProgress?.({
-          completed: clampProgress(25 + (results.length / chunkFiles.length) * 65),
-          stage: "transcribing",
-          message: `Transcribed ${results.length} of ${chunkFiles.length} chunks`,
-          currentChunk: results.length,
-          totalChunks: chunkFiles.length,
-        });
-      }
+            );
 
-      // Clean up chunk files
-      await Promise.all(chunkFiles.map((file) => unlink(file).catch(() => {})));
+            return {
+              chunkNumber: i + batchIndex + 1,
+              text,
+            };
+          })
+        );
+
+        for (const batchResult of batchResults) {
+          results[batchResult.chunkNumber - 1] = batchResult.text;
+          const completedChunks = results.filter(
+            (result) => result !== undefined
+          ).length;
+
+          onProgress?.({
+            completed: clampProgress(
+              25 + (completedChunks / chunkFiles.length) * 65
+            ),
+            stage: "transcribing",
+            message: `Transcribed ${completedChunks} of ${chunkFiles.length} chunks`,
+            currentChunk: batchResult.chunkNumber,
+            totalChunks: chunkFiles.length,
+            chunkText: batchResult.text,
+          });
+        }
+      }
 
       // Combine results
       const combinedText = results.filter((r) => r.length > 0).join(" ");
@@ -673,6 +707,11 @@ export class TranscriptionService {
           error instanceof Error ? error.message : "Unknown error"
         }`
       );
+    } finally {
+      await Promise.all(chunkFiles.map((file) => unlink(file).catch(() => {})));
+      if (convertedChunkSourcePath) {
+        await unlink(convertedChunkSourcePath).catch(() => {});
+      }
     }
   }
 
@@ -777,19 +816,51 @@ export class TranscriptionService {
    */
   private async getAudioDuration(filePath: string): Promise<number> {
     try {
-      const { stdout } = await execAsync(
-        `ffprobe -v error -show_entries format=duration -of default=noprint_wrappers=1:nokey=1 "${filePath}"`
+      const { stdout } = await execFileAsync(
+        "ffprobe",
+        [
+          "-v",
+          "error",
+          "-print_format",
+          "json",
+          "-show_format",
+          "-show_streams",
+          filePath,
+        ],
+        { maxBuffer: 10 * 1024 * 1024 }
       );
-      const duration = parseFloat(stdout.trim());
-      if (isNaN(duration)) {
+      const metadata = JSON.parse(stdout);
+      const duration = this.findDurationFromFfprobe(metadata);
+
+      if (duration) {
+        return duration;
+      }
+
+      const estimatedDuration = await this.estimateDurationFromBitrate(
+        filePath,
+        metadata
+      );
+
+      if (!estimatedDuration) {
         this.serviceLogger.warn(
           { filePath },
-          "Could not parse audio duration, defaulting to estimate"
+          "Could not parse audio duration"
         );
         return 0;
       }
-      return duration;
+
+      this.serviceLogger.warn(
+        { filePath, estimatedDuration },
+        "Estimated audio duration from bitrate"
+      );
+      return estimatedDuration;
     } catch (error) {
+      if (this.isExecutableNotFoundError(error)) {
+        throw new Error(
+          "ffprobe executable not found. Install FFmpeg and ensure ffprobe is available on PATH."
+        );
+      }
+
       this.serviceLogger.warn(
         {
           error: error instanceof Error ? error.message : "Unknown error",
@@ -799,6 +870,96 @@ export class TranscriptionService {
       );
       return 0;
     }
+  }
+
+  private findDurationFromFfprobe(metadata: any): number {
+    const candidates = [
+      metadata?.format?.duration,
+      ...(Array.isArray(metadata?.streams)
+        ? metadata.streams.map((stream: any) => stream?.duration)
+        : []),
+    ];
+
+    for (const candidate of candidates) {
+      const duration = Number.parseFloat(candidate);
+      if (duration > 0 && Number.isFinite(duration)) {
+        return duration;
+      }
+    }
+
+    return 0;
+  }
+
+  private async estimateDurationFromBitrate(
+    filePath: string,
+    metadata: any
+  ): Promise<number> {
+    const candidates = [
+      metadata?.format?.bit_rate,
+      ...(Array.isArray(metadata?.streams)
+        ? metadata.streams.map((stream: any) => stream?.bit_rate)
+        : []),
+    ];
+
+    for (const candidate of candidates) {
+      const bitRate = Number.parseFloat(candidate);
+      if (bitRate > 0 && Number.isFinite(bitRate)) {
+        const fileStats = await stat(filePath);
+        return (fileStats.size * 8) / bitRate;
+      }
+    }
+
+    return 0;
+  }
+
+  private async createOptimizedWavChunk(
+    inputPath: string,
+    outputPath: string,
+    startTime: number,
+    duration: number
+  ): Promise<void> {
+    try {
+      await execFileAsync(
+        "ffmpeg",
+        [
+          "-v",
+          "error",
+          "-y",
+          "-ss",
+          String(startTime),
+          "-i",
+          inputPath,
+          "-t",
+          String(duration),
+          "-vn",
+          "-ar",
+          String(OPTIMIZED_WAV_SAMPLE_RATE),
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_s16le",
+          outputPath,
+        ],
+        { maxBuffer: 10 * 1024 * 1024 }
+      );
+    } catch (error) {
+      if (this.isExecutableNotFoundError(error)) {
+        throw new Error(
+          "ffmpeg executable not found. Install FFmpeg and ensure ffmpeg is available on PATH."
+        );
+      }
+
+      throw error;
+    }
+  }
+
+  private isExecutableNotFoundError(error: unknown): boolean {
+    return (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      (error as { code?: unknown }).code === "ENOENT"
+    );
   }
 
   /**
@@ -822,14 +983,35 @@ export class TranscriptionService {
       // -ac 1: mono channel (reduces file size by 50% vs stereo)
       // -c:a pcm_s16le: PCM 16-bit little-endian (standard WAV format)
       const sampleRate = optimized ? "8000" : "16000";
-      await execAsync(
-        `ffmpeg -i "${filePath}" -ar ${sampleRate} -ac 1 -c:a pcm_s16le "${outputPath}" -y`
+      await execFileAsync(
+        "ffmpeg",
+        [
+          "-v",
+          "error",
+          "-y",
+          "-i",
+          filePath,
+          "-ar",
+          sampleRate,
+          "-ac",
+          "1",
+          "-c:a",
+          "pcm_s16le",
+          outputPath,
+        ],
+        { maxBuffer: 10 * 1024 * 1024 }
       );
 
       const logger = log || this.serviceLogger;
       logger.info({ sampleRate, outputPath }, "Successfully converted to WAV");
       return outputPath;
     } catch (error) {
+      if (this.isExecutableNotFoundError(error)) {
+        throw new Error(
+          "ffmpeg executable not found. Install FFmpeg and ensure ffmpeg is available on PATH."
+        );
+      }
+
       const logger = log || this.serviceLogger;
       logger.error(
         {
