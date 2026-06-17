@@ -10,6 +10,20 @@ const execAsync = promisify(exec);
 // OpenAI Whisper API file size limit: 25MB
 const MAX_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25MB
 
+export type TranscriptionProgress = {
+  completed: number;
+  stage: string;
+  message: string;
+  currentChunk?: number;
+  totalChunks?: number;
+};
+
+type ProgressCallback = (progress: TranscriptionProgress) => void;
+
+function clampProgress(value: number): number {
+  return Math.max(0, Math.min(100, Math.round(value)));
+}
+
 /**
  * Service for managing audio transcription using OpenAI's Whisper API
  */
@@ -61,7 +75,8 @@ export class TranscriptionService {
     language?: string,
     useDiarize?: boolean,
     requestId?: string,
-    useHighAccuracy?: boolean
+    useHighAccuracy?: boolean,
+    onProgress?: ProgressCallback
   ): Promise<string> {
     await this.initialize();
 
@@ -84,10 +99,20 @@ export class TranscriptionService {
 
     try {
       log.info("Starting transcription");
+      onProgress?.({
+        completed: 5,
+        stage: "started",
+        message: "Transcription request accepted",
+      });
 
       // Check original file size
       const originalStats = await stat(filePath);
       const originalSizeMB = originalStats.size / (1024 * 1024);
+      onProgress?.({
+        completed: 10,
+        stage: "validating",
+        message: "Audio file validated",
+      });
       log.info(
         { originalSizeMB: originalSizeMB.toFixed(2) },
         "File size checked"
@@ -111,7 +136,8 @@ export class TranscriptionService {
           language,
           useDiarize,
           requestId,
-          useHighAccuracy
+          useHighAccuracy,
+          onProgress
         );
       }
 
@@ -132,6 +158,11 @@ export class TranscriptionService {
             type: mimeType,
             lastModified: Date.now(),
           });
+          onProgress?.({
+            completed: 45,
+            stage: "transcribing",
+            message: "Audio sent to OpenAI for transcription",
+          });
 
           const transcription = await this.openai.audio.transcriptions.create({
             file: file,
@@ -149,6 +180,11 @@ export class TranscriptionService {
             { textLength: text.length },
             "Transcription completed using original format"
           );
+          onProgress?.({
+            completed: 90,
+            stage: "transcribed",
+            message: "Transcript generated",
+          });
           return text.trim();
         } catch (error: any) {
           // If original format fails, fall back to WAV conversion
@@ -171,9 +207,19 @@ export class TranscriptionService {
       // Convert to WAV format if original format didn't work or isn't supported
       if (fileExt !== "wav") {
         log.info({ fileExt }, "Converting to optimized WAV format");
+        onProgress?.({
+          completed: 25,
+          stage: "converting",
+          message: "Converting audio to WAV",
+        });
         convertedFilePath = await this.convertToWav(filePath, true, log); // optimized
         finalFilePath = convertedFilePath;
         log.debug({ convertedFilePath }, "File converted to WAV");
+        onProgress?.({
+          completed: 35,
+          stage: "converted",
+          message: "Audio conversion completed",
+        });
       }
 
       // Read the file and create a File object for OpenAI API
@@ -197,7 +243,8 @@ export class TranscriptionService {
           language,
           useDiarize,
           requestId,
-          useHighAccuracy
+          useHighAccuracy,
+          onProgress
         );
       }
 
@@ -211,6 +258,11 @@ export class TranscriptionService {
         { fileName, fileSizeMB: fileSizeMB.toFixed(2), mimeType: "audio/wav" },
         "File prepared for transcription"
       );
+      onProgress?.({
+        completed: 45,
+        stage: "transcribing",
+        message: "Audio sent to OpenAI for transcription",
+      });
 
       // Call OpenAI's Whisper API
       const transcription = await this.openai.audio.transcriptions.create({
@@ -227,6 +279,11 @@ export class TranscriptionService {
           : (transcription as any).text || "";
 
       log.info({ textLength: text.length }, "Transcription completed");
+      onProgress?.({
+        completed: 90,
+        stage: "transcribed",
+        message: "Transcript generated",
+      });
 
       // Clean up converted file if we created one
       if (convertedFilePath) {
@@ -431,7 +488,8 @@ export class TranscriptionService {
     language?: string,
     useDiarize?: boolean,
     requestId?: string,
-    useHighAccuracy?: boolean
+    useHighAccuracy?: boolean,
+    onProgress?: ProgressCallback
   ): Promise<string> {
     // Priority: diarize > high accuracy > default mini
     const model = useDiarize
@@ -451,6 +509,11 @@ export class TranscriptionService {
     try {
       // Get audio duration to calculate chunk size
       const duration = await this.getAudioDuration(filePath);
+      onProgress?.({
+        completed: 15,
+        stage: "analyzing",
+        message: "Audio duration analyzed",
+      });
 
       // Validate duration - must be positive to calculate chunk sizes
       if (!duration || duration <= 0 || !isFinite(duration)) {
@@ -506,6 +569,12 @@ export class TranscriptionService {
         },
         "Splitting into chunks (required due to 25MB file size limit, cost remains the same)"
       );
+      onProgress?.({
+        completed: 20,
+        stage: "chunking",
+        message: `Splitting audio into ${numChunks} chunks`,
+        totalChunks: numChunks,
+      });
 
       // Create chunk files
       const chunkFiles: string[] = [];
@@ -524,6 +593,12 @@ export class TranscriptionService {
         { chunkCount: chunkFiles.length },
         "Created chunk files, processing in parallel"
       );
+      onProgress?.({
+        completed: 25,
+        stage: "chunks-created",
+        message: "Audio chunks created",
+        totalChunks: chunkFiles.length,
+      });
 
       // Process chunks in parallel (max 2 at a time to avoid rate limits)
       const maxConcurrent = 2;
@@ -555,6 +630,13 @@ export class TranscriptionService {
           )
         );
         results.push(...batchResults);
+        onProgress?.({
+          completed: clampProgress(25 + (results.length / chunkFiles.length) * 65),
+          stage: "transcribing",
+          message: `Transcribed ${results.length} of ${chunkFiles.length} chunks`,
+          currentChunk: results.length,
+          totalChunks: chunkFiles.length,
+        });
       }
 
       // Clean up chunk files
@@ -569,6 +651,13 @@ export class TranscriptionService {
         },
         "Combined transcription from chunks"
       );
+      onProgress?.({
+        completed: 90,
+        stage: "transcribed",
+        message: "Transcript generated from all chunks",
+        currentChunk: results.length,
+        totalChunks: chunkFiles.length,
+      });
 
       return combinedText;
     } catch (error) {

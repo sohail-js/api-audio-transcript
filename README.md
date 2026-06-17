@@ -7,15 +7,17 @@ A fast Node.js API server for audio transcription using OpenAI's Whisper API.
 - **Multilingual transcription** supporting Hindi, Urdu, English, and 99+ languages
 - **Automatic language detection** - no need to specify the language
 - Fast audio transcription using OpenAI's Whisper API
+- Streaming progress responses with `Completed` percentage updates
 - Simple REST API with Hono framework
 - TypeScript support
 - Supports all common audio formats (MP3, WAV, M4A, FLAC, OGG, etc.)
-- No local model downloads or dependencies required
+- No local model downloads required
 
 ## Prerequisites
 
 - Node.js 18+
 - npm or yarn
+- FFmpeg and ffprobe available on `PATH` for large files, AAC files, and audio conversion
 - **OpenAI API Key** - Get one from [OpenAI Platform](https://platform.openai.com/api-keys)
 
 ## Installation
@@ -68,6 +70,7 @@ Transcribes an audio file to text using OpenAI's Whisper API.
 - Query Parameters:
   - `diarize` (optional): Set to `true`, `1`, or `yes` to enable speaker diarization for multi-speaker audio (meetings, interviews, etc.)
   - `accurate` (optional): Set to `true`, `1`, or `yes` to use `gpt-4o-transcribe` model for higher accuracy (better for background noise, complex dialogues, etc.)
+  - `stream` (optional): Set to `true`, `1`, or `yes` to receive Server-Sent Events progress updates. You can also use `POST /transcribe/stream`.
 
 **Example using curl (standard transcription):**
 
@@ -94,14 +97,39 @@ curl -X POST "http://localhost:3001/transcribe?accurate=true" \
 
 ```json
 {
+  "Completed": "100%",
+  "completed": 100,
   "text": "transcribed text in original language",
   "processingTimeSeconds": 5.2,
   "processingTimeMs": 5200,
   "requestId": "req-1234567890-abcde",
-  "debugPath": "/path/to/requests/req-1234567890-abcde",
   "model": "gpt-4o-mini-transcribe",
-  "diarize": false
+  "diarize": false,
+  "accurate": false
 }
+```
+
+### Streaming Response
+
+Use `POST /transcribe/stream` or `POST /transcribe?stream=true` to receive `text/event-stream` updates while transcription is running.
+
+```bash
+curl -N -X POST http://localhost:3001/transcribe/stream \
+  -F "audio=@path/to/your/audio.mp3"
+```
+
+Progress events include a display-friendly `Completed` percentage and numeric `completed` value:
+
+```text
+event: progress
+data: {"Completed":"45%","completed":45,"stage":"transcribing","message":"Audio sent to OpenAI for transcription","requestId":"req-1234567890-abcde"}
+```
+
+When processing is finished, the API sends a final `completed` event with the transcript:
+
+```text
+event: completed
+data: {"Completed":"100%","completed":100,"text":"transcribed text in original language","processingTimeSeconds":5.2,"processingTimeMs":5200,"requestId":"req-1234567890-abcde","model":"gpt-4o-mini-transcribe","diarize":false,"accurate":false}
 ```
 
 **Note:** 
